@@ -1,7 +1,13 @@
---[[
-	WARNING: Heads up! This script has not been verified by ScriptBlox. Use at your own risk!
-]]
--- https://ads.luarmor.net/get_key?for=AR_Script-rdNWLsEJVrDv
+if not game:IsLoaded() then
+    game.Loaded:Wait()
+end
 
-script_key="TFeBFPvlSRkwOpTqJVWCdlkzZLQFmyeK"; 
-loadstring(game:HttpGet("https://raw.githubusercontent.com/JustLevel/goombahub/main/goombahub.lua"))()
+local player = game.Players.LocalPlayer
+if not player.Character or not player.Character:FindFirstChild("HumanoidRootPart") then
+    player.CharacterAdded:Wait()
+    repeat task.wait() until player.Character and player.Character:FindFirstChild("HumanoidRootPart")
+end
+
+local wait_time = 0
+task.wait(wait_time)
+loadstring(game:HttpGet("https://raw.githubusercontent.com/YOies/KazounVN/refs/heads/main/ARX"))()
