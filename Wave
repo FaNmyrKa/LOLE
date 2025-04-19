@@ -1,7 +1,1 @@
---[[
-    WARNING: Heads up! This script has not been verified by ScriptBlox. Use at your own risk!
-]]
--- https://ads.luarmor.net/get_key?for=AR_Script-rdNWLsEJVrDv
-
-script_key="TFeBFPvlSRkwOpTqJVWCdlkzZLQFmyeK"; 
-loadstring(game:HttpGet("https://raw.githubusercontent.com/JustLevel/goombahub/main/goombahub.lua"))()
+loadstring(game:HttpGet("https://raw.githubusercontent.com/Winnable-Hub/Loader/refs/heads/main/Loader.Lua"))()
