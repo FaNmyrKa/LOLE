@@ -14,4 +14,4 @@ getgenv().UserPreference = {
     }
 }
 
-loadstring(game:HttpGet("http://loader.strelizia.cc"))()/
+loadstring(game:HttpGet("http://loader.strelizia.cc"))()
