@@ -1,17 +1,1 @@
-getgenv().UserPreference = {
-    MinimumRiftMultipliers = {
-        ['Pastel Egg'] = 25,
-    },
-    RiftPriorities = {
-        'Rainbow Egg',
-        'Nightmare Egg',
-    },
-    QuestPriority = {
-        "Egg",
-        "Rarity",
-        "Shiny",
-        "Mythic"
-    }
-}
-
 loadstring(game:HttpGet("http://loader.strelizia.cc"))()
