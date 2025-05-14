@@ -1,3 +1,4 @@
+wait(15)
 -- Получаем сервисы
 local Players           = game:GetService("Players")
 local HttpService       = game:GetService("HttpService")
