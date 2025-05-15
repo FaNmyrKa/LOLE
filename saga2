@@ -1,17 +1,2 @@
-getgenv().UserConfig = {
-    AutoStartStory      = {2, 3, 1},
-    KillAura = { OffsetY = 5, HoverRadius = 7, HoverSpeed = 3 },
-    RestartIfNoMobsAfter = 5,
-    KeyUse = {
-        {Enum.KeyCode.ButtonX, 4},
-        {Enum.KeyCode.Z,       1},
-        {Enum.KeyCode.ButtonX, 4},
-        {Enum.KeyCode.X, 1},
-        {Enum.KeyCode.ButtonX, 4},
-        {Enum.KeyCode.C,       1},
-    },
-    AutoReplay          = false,
-    AutoNext            = true,
-}
-
-loadstring(game:HttpGet("https://raw.githubusercontent.com/HOSTI1315/autoscript/refs/heads/main/SagaTestApiGConf"))()
+script_key="kdcZTXGWmIpqkCQcisQaCeJXnNjSRciw";
+loadstring(game:HttpGet("https://api.luarmor.net/files/v3/loaders/2ce7e630501737f0c9ee24a2e809565d.lua"))()
