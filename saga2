@@ -1,16 +1,14 @@
 getgenv().UserConfig = {
-    AutoStartStory     = {"R", 1, 1, 1},
+    AutoStartStory = {"R", 1, 1, 1},
     KillAura = { OffsetY = 5, HoverRadius = 7, HoverSpeed = 3 },
     RestartIfNoMobsAfter = 5,
     KeyUse = {
         {Enum.KeyCode.ButtonX, 4},
         {Enum.KeyCode.Z,       1},
         {Enum.KeyCode.ButtonX, 4},
-        {Enum.KeyCode.X,       1},
+        {Enum.KeyCode.X, 1},
         {Enum.KeyCode.ButtonX, 4},
         {Enum.KeyCode.C,       1},
-        {Enum.KeyCode.ButtonX, 4},
-        {Enum.KeyCode.V,       1},
     },
     AutoReplay          = false,
     AutoNext            = true,
