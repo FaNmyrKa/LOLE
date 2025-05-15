@@ -1,1 +1,17 @@
-loadstring(game:HttpGet("https://raw.githubusercontent.com/Winnable-Hub/Loader/refs/heads/main/Loader.Lua"))()
+getgenv().UserConfig = {
+    AutoStartStory      = {2, 3, 1},
+    KillAura = { OffsetY = 5, HoverRadius = 7, HoverSpeed = 3 },
+    RestartIfNoMobsAfter = 5,
+    KeyUse = {
+        {Enum.KeyCode.ButtonX, 4},
+        {Enum.KeyCode.Z,       1},
+        {Enum.KeyCode.ButtonX, 4},
+        {Enum.KeyCode.X, 1},
+        {Enum.KeyCode.ButtonX, 4},
+        {Enum.KeyCode.C,       1},
+    },
+    AutoReplay          = false,
+    AutoNext            = true,
+}
+
+loadstring(game:HttpGet("https://raw.githubusercontent.com/HOSTI1315/autoscript/refs/heads/main/SagaTestApiGConf"))()
