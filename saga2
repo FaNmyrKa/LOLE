@@ -12,8 +12,8 @@ getgenv().UserConfig = {
         {Enum.KeyCode.ButtonX, 4},
         {Enum.KeyCode.V,       1},
     },
-    AutoReplay          = false,
-    AutoNext            = true,
+    AutoReplay          = true,
+    AutoNext            = false,
 }
 
 loadstring(game:HttpGet("https://raw.githubusercontent.com/HOSTI1315/autoscript/refs/heads/main/SagaTestApiGConf"))()
