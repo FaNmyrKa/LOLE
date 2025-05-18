@@ -15,7 +15,7 @@ getgenv().UserConfig = {
     AutoLeave           = false,
     Webhook = {
             Enable = true,
-            URL = "huifanasmallbig"
+            URL = "https://discord.com/api/webhooks/1365772049540452473/zgN9IpOXJfYbKsLoSt1o596k6XmwgtkOwIcofyo1NjxDwy20j4mGyG4jw1Q8PfcRX1MN"
     },
 }
 
