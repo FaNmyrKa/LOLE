@@ -1,0 +1,41 @@
+wait(60)
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local LocalData = require(ReplicatedStorage.Client.Framework.Services.LocalData)
+print()
+local function rerunQuests()
+    local targetQuestIds = {
+        ["competitive-3"] = true,
+        ["competitive-4"] = true
+    }
+    local questIdToNumber = {
+        ["competitive-3"] = 3,
+        ["competitive-4"] = 4
+    }
+
+    while true do
+        local Data = LocalData:Get() -- Refresh data each loop
+        for _, quest in Data.Quests do
+            if targetQuestIds[quest.Id] then
+                local hasShinyOrMythic = false
+                for key, titka in quest.Tasks[1] do
+                    if key == "Shiny" or key == "Mythic" or titka == "Legendary" then
+                        hasShinyOrMythic = true
+                        break
+                    end
+                end
+
+                if not hasShinyOrMythic then
+                    local args = {
+                        [1] = "CompetitiveReroll",
+                        [2] = questIdToNumber[quest.Id]
+                    }
+                    ReplicatedStorage.Shared.Framework.Network.Remote.RemoteEvent:FireServer(unpack(args))
+                end
+            end
+        end
+        task.wait(0.6) -- Wait 0.1 seconds before next iteration
+    end
+end
+
+
+rerunQuests()
