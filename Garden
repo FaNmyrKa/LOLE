@@ -1,1 +1,2 @@
-loadstring(game:HttpGet('https://dpaste.com/7DDEPUBSD.txt'))()
+script_key="xuxsVKFecWxcPtgERDIOTNCNCCuZMzly"
+loadstring(game:HttpGet("https://zekehub.com/scripts/Loader.lua"))()
