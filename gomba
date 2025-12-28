@@ -1,2 +1,2 @@
-getgenv().script_key = "OjTzuyRGkqfXepOeNqWuVpTLTmwpcMkq";
+getgenv().script_key = "BrJmFkJndiIphNadsamLFRGxuVRPInSV";
 loadstring(game:HttpGet("https://raw.githubusercontent.com/JustLevel/goombahub/main/goombahub.lua"))()
