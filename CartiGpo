@@ -1,7 +1,2 @@
-getgenv().queueonteleport=function()end; getgenv().queue_on_teleport=function()end;
-xpcall(function()
-loadstring(game:HttpGet("https://raw.githubusercontent.com/ChronicallyOnlineSkid123/TexchyIsASkid/refs/heads/main/feralcracked.lua"))()
-end, function(...)
-       game:GetService("Players").LocalPlayer:Kick("Failed to load.");
-       warn(...);
-end)
+script_key="xscLBLKvfJoBEGbquLEEwWsYdoQZaiwL";
+loadstring(game:HttpGet("https://api.luarmor.net/files/v3/loaders/c5f501e2e9f1ad4cb2f7b6b9c0aa2719.lua"))()
