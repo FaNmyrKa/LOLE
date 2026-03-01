@@ -1,0 +1,1 @@
+loadstring(game:HttpGet("https://raw.githubusercontent.com/rayanne28/neptune/refs/heads/main/BIZZARELEGACY.lua"))()
