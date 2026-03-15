@@ -31,30 +31,54 @@ local function patchTable(t)
     return n
 end
 
--- Общий обработчик для Replica remotes: патчит таблицы в args, логирует
+-- Патч args (таблицы + singleton NaN) и возврат исправленного списка
+local function patchArgs(...)
+    local args = {...}
+    local total = 0
+    for i, v in ipairs(args) do
+        if type(v) == "table" then
+            total = total + patchTable(v)
+        elseif isNaN(v) then
+            args[i] = 0
+            total = total + 1
+            log("arg", i, "NaN -> 0")
+        end
+    end
+    return total, args
+end
+
+-- Хук Connect: все callback'и получают патченные args (в т.ч. ReplicaClient)
+local function wrapRemoteConnect(remote, name)
+    if not remote then return end
+    local signal = remote.OnClientEvent
+    local origConnect = signal.Connect
+    signal.Connect = function(self, callback)
+        return origConnect(self, function(...)
+            local total, args = patchArgs(...)
+            if LOG_REPLICA or total > 0 then
+                log(name, "fired | args:", #args, "| patched:", total)
+            end
+            if total > 0 then warn("[BannerPity Repair] Patched", total, "NaN in", name) end
+            return callback(unpack(args))
+        end)
+    end
+    log("Wrapped Connect:", name)
+end
+
+-- Подключаем свой handler только для логов
 local function hookReplicaRemote(name, remote)
     if not remote then return end
     remote.OnClientEvent:Connect(function(...)
-        local args = {...}
-        local total = 0
-        for i, v in ipairs(args) do
-            if type(v) == "table" then
-                total = total + patchTable(v)
-            elseif isNaN(v) then
-                log(name, "arg", i, "= NaN (singleton, can't patch)")
-            end
-        end
+        local total, args = patchArgs(...)
         if LOG_REPLICA or total > 0 then
-            log(name, "fired | args:", #args, "| patched NaN:", total)
+            log(name, "fired | args:", #args, "| patched:", total)
         end
-        if total > 0 then
-            warn("[BannerPity Repair] Patched", total, "NaN in", name)
-        end
+        if total > 0 then warn("[BannerPity Repair] Patched", total, "NaN in", name) end
     end)
     log("Hooked", name)
 end
 
--- Хук всех Replica remotes (данные могут идти через любой)
+-- Хук всех Replica remotes
 local RemoteEvents = ReplicatedStorage:WaitForChild("RemoteEvents", 3)
 if not RemoteEvents then log("RemoteEvents not found — Replica hooks skipped") end
 local replicaRemotes = {
@@ -62,6 +86,37 @@ local replicaRemotes = {
     "ReplicaTableInsert", "ReplicaTableRemove", "ReplicaRequestData", "ReplicaParent"
 }
 
+-- Сначала wrap Connect (чтобы новые handler'ы получали патч)
+for _, rname in ipairs(replicaRemotes) do
+    local r = RemoteEvents and RemoteEvents:FindFirstChild(rname)
+    if r then wrapRemoteConnect(r, rname) end
+end
+
+-- Fallback: getconnections — переподключить существующие handler'ы с патчем (если executor даёт .Function)
+local getconn = rawget(_G, "getconnections")
+if type(getconn) == "function" then
+    for _, rname in ipairs(replicaRemotes) do
+        local r = RemoteEvents and RemoteEvents:FindFirstChild(rname)
+        if r then
+            local ok, conns = pcall(getconn, r.OnClientEvent)
+            if ok and type(conns) == "table" then
+                for _, c in ipairs(conns) do
+                    local fn = c.Function or c.Callback
+                    if fn and c.Disconnect then
+                        c:Disconnect()
+                        r.OnClientEvent:Connect(function(...)
+                            local _, args = patchArgs(...)
+                            fn(unpack(args))
+                        end)
+                        log("Re-wired", rname)
+                    end
+                end
+            end
+        end
+    end
+end
+
+-- Наш handler для логов
 for _, rname in ipairs(replicaRemotes) do
     local r = RemoteEvents and RemoteEvents:FindFirstChild(rname)
     if r then hookReplicaRemote(rname, r) end
@@ -295,4 +350,4 @@ end)
 log("=== Started ===")
 log("Replica hooks:", table.concat(replicaRemotes, ", "))
 log("RequestBannerSummon hook:", hookfn and "YES (hookfunction)" or "NO")
-log("Run BEFORE summon if already corrupted. Replica hooks log every event.")
+log("Tip: run script BEFORE joining (auto-exec) so Connect wrap catches ReplicaClient")
