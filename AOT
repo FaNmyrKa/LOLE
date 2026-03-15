@@ -1,2 +1,220 @@
-script_key="xuxsVKFecWxcPtgERDIOTNCNCCuZMzly"
-loadstring(game:HttpGet("https://zekehub.com/scripts/Loader.lua"))()
+-- Repair BannerPity after NaN bug (Anime Paradox)
+-- Метод 1: Хук ReplicaSetValues — патчим payload до обработки (без WaitForPlayerData)
+-- Метод 2: ReplicaClient cache, upvalues, proxy hook
+
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Players = game:GetService("Players")
+local LocalPlayer = Players.LocalPlayer
+
+if not game:IsLoaded() then game.Loaded:Wait() end
+
+local function isNaN(x)
+    return type(x) == "number" and x ~= x
+end
+
+local function patchTable(t)
+    if type(t) ~= "table" then return 0 end
+    local n = 0
+    for k, v in pairs(t) do
+        if isNaN(v) then
+            local ok = pcall(rawset, t, k, 0)
+            if ok then n = n + 1 end
+        elseif type(v) == "table" then
+            n = n + patchTable(v)
+        end
+    end
+    return n
+end
+
+-- Метод 1: Хук ReplicaSetValues — подключаемся как можно раньше
+local RemoteEvents = ReplicatedStorage:WaitForChild("RemoteEvents", 3)
+local ReplicaSetValues = RemoteEvents and RemoteEvents:FindFirstChild("ReplicaSetValues")
+if ReplicaSetValues then
+    ReplicaSetValues.OnClientEvent:Connect(function(...)
+        local args = {...}
+        local total = 0
+        for _, v in ipairs(args) do
+            if type(v) == "table" then
+                total = total + patchTable(v)
+            elseif isNaN(v) then
+                -- singleton value (e.g. path, value) — can't patch in-place, skip
+            end
+        end
+        if total > 0 then
+            print("[BannerPity Repair] Patched", total, "NaN in ReplicaSetValues payload")
+        end
+    end)
+    print("[BannerPity Repair] ReplicaSetValues hook active — NaN patched on receive")
+end
+
+task.wait(1)
+
+local function wfc(p, n, t) return p:WaitForChild(n, t or 5) end
+local RS = ReplicatedStorage
+local Modules = wfc(RS, "Modules")
+local Shared = wfc(Modules, "Shared")
+local Handlers = Shared:FindFirstChild("Handlers")
+local ReplicaHandler = Handlers and Handlers:FindFirstChild("ReplicaHandler")
+
+-- Способ 1: Хук WaitForPlayerData — возвращаем proxy с подменой nan
+local function createNaNProxy(t)
+    if type(t) ~= "table" then return t end
+    return setmetatable({}, {
+        __index = function(_, k)
+            local v = t[k]
+            if isNaN(v) then return 0 end
+            if type(v) == "table" then return createNaNProxy(v) end
+            return v
+        end,
+    })
+end
+
+local function repair()
+    local player = Players.LocalPlayer
+    if not player or not player.UserId then
+        return false, "LocalPlayer not ready"
+    end
+
+    -- Сначала пробуем ReplicaClient (без ReplicaHandler — избегаем UserId error)
+    local ps = player:FindFirstChild("PlayerScripts")
+    local rc = ps and ps:FindFirstChild("ClientCache") and ps.ClientCache:FindFirstChild("Utility") and ps.ClientCache.Utility:FindFirstChild("ReplicaClient")
+    if rc then
+        local ok, mod = pcall(require, rc)
+        if ok and mod then
+            -- ReplicaClient: ищем Replicas, _replicas, GetReplica, .Data в любых полях
+            local function scan(obj, depth)
+                if depth > 3 then return 0 end
+                if type(obj) ~= "table" then return 0 end
+                for k, v in pairs(obj) do
+                    if type(v) == "table" and (v.Data or v.RawData or v.BannerPity or (v.ClientData and v.ClientData.BannerPity)) then
+                        local t = v.Data or v.RawData or v
+                        if type(t) == "table" then
+                            local patched = patchTable(t)
+                            if patched > 0 then
+                                print("[BannerPity Repair] Patched via ReplicaClient", tostring(k), ":", patched)
+                                return patched
+                            end
+                        end
+                    elseif type(v) == "table" and not rawequal(v, mod) then
+                        local n = scan(v, depth + 1)
+                        if n > 0 then return n end
+                    end
+                end
+                return 0
+            end
+            if scan(mod, 0) > 0 then return true end
+        end
+    end
+
+    if not ReplicaHandler then return false, "no ReplicaHandler" end
+    local ok, handler = pcall(require, ReplicaHandler)
+    if not ok or not handler then
+        return false, "require failed"
+    end
+
+    -- Инжект LocalPlayer: handler может брать player из script.Parent или upvalue
+    local function injectIntoFn(fn)
+        if type(fn) ~= "function" then return end
+        for i = 1, 50 do
+            local name, val = debug.getupvalue(fn, i)
+            if not name then break end
+            if val == nil and type(name) == "string" then
+                local lower = name:lower()
+                if lower:find("player") or lower:find("plr") or lower:find("local") then
+                    pcall(debug.setupvalue, fn, i, player)
+                end
+            end
+        end
+    end
+    for k, v in pairs(handler) do
+        injectIntoFn(v)
+    end
+    injectIntoFn(handler.WaitForPlayerData)
+
+    local pd
+    local waitFn = handler.WaitForPlayerData
+    if type(waitFn) == "function" then
+        local ok, res = pcall(waitFn, handler, player)
+        if not ok and res and tostring(res):find("UserId") then
+            return false, "ReplicaHandler needs game context (UserId nil) — use ReplicaSetValues hook"
+        end
+        if ok and res then pd = res end
+        if not pd then
+            ok, res = pcall(waitFn, handler)
+            if not ok and res and tostring(res):find("UserId") then
+                return false, "ReplicaHandler needs game context"
+            end
+            if ok and res then pd = res end
+        end
+    end
+    if not pd then
+        return false, "no PlayerData"
+    end
+
+    -- Способ A: Прямая запись (если не read-only)
+    local n = patchTable(pd)
+    if n > 0 then
+        print("[BannerPity Repair] Patched", n, "nan values")
+        return true, "patched"
+    end
+
+    -- Способ B: Ищем upvalue с данными
+    for _, method in ipairs({"WaitForPlayerData", "GetPlayerData", "RequestData"}) do
+        local fn = handler[method]
+        if type(fn) == "function" then
+            for i = 1, 50 do
+                local name, val = debug.getupvalue(fn, i)
+                if not name then break end
+                if type(val) == "table" and (val.BannerPity or val.ClientData) then
+                    local patched = patchTable(val)
+                    if patched > 0 then
+                        print("[BannerPity Repair] Patched via upvalue", method, name, ":", patched)
+                        return true
+                    end
+                end
+            end
+        end
+    end
+
+    -- Способ C: Хук WaitForPlayerData (если ReplicaHandler требует player context)
+    if not handler._RepairHooked then
+        local orig = handler.WaitForPlayerData
+        if type(orig) == "function" then
+            handler.WaitForPlayerData = function(...)
+                local result = orig(...)
+                if result and type(result) == "table" then
+                    return createNaNProxy(result)
+                end
+                return result
+            end
+            handler._RepairHooked = true
+            print("[BannerPity Repair] Hooked WaitForPlayerData — новые вызовы получат proxy")
+            return true
+        end
+    end
+
+    return false, "read-only"
+end
+
+-- Запуск (с задержкой — ReplicaHandler может грузиться после входа)
+task.spawn(function()
+    for attempt = 1, 5 do
+        task.wait(attempt * 2)
+        local ok, success = pcall(repair)
+        if ok and success then
+            print("[BannerPity Repair] Done. Try summon.")
+            return
+        end
+    end
+    warn("[BannerPity Repair] Failed after 5 attempts. Run when in lobby with inventory open.")
+end)
+
+-- Периодический repair
+task.spawn(function()
+    while true do
+        task.wait(8)
+        pcall(repair)
+    end
+end)
+
+print("[BannerPity Repair] Started. Methods: direct patch, upvalue, proxy hook.")
