@@ -1,12 +1,17 @@
 -- Repair BannerPity after NaN bug (Anime Paradox)
--- Метод 1: Хук ReplicaSetValues — патчим payload до обработки (без WaitForPlayerData)
--- Метод 2: ReplicaClient cache, upvalues, proxy hook
+-- БАГ: RequestBannerSummon("Jujutsu", 0/0) отправляет NaN → сервер портит BannerPity → Replica шлёт nan клиенту
+-- Что ещё ломается NaN: RequestPod, ClaimIndexReward, ClaimReward, ClaimMilestone, ClaimAFKMilestone, UseItem, SellItem
+-- Методы: 1) Хук Replica* remotes, 2) Хук RequestBannerSummon (санитизация), 3) ReplicaClient cache
 
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Players = game:GetService("Players")
 local LocalPlayer = Players.LocalPlayer
 
 if not game:IsLoaded() then game.Loaded:Wait() end
+
+local LOG = true       -- логи на все хуки
+local LOG_REPLICA = true -- логировать каждый Replica fire (поставь false если спам)
+local function log(...) if LOG then print("[BannerPity Repair]", ...) end end
 
 local function isNaN(x)
     return type(x) == "number" and x ~= x
@@ -26,25 +31,64 @@ local function patchTable(t)
     return n
 end
 
--- Метод 1: Хук ReplicaSetValues — подключаемся как можно раньше
-local RemoteEvents = ReplicatedStorage:WaitForChild("RemoteEvents", 3)
-local ReplicaSetValues = RemoteEvents and RemoteEvents:FindFirstChild("ReplicaSetValues")
-if ReplicaSetValues then
-    ReplicaSetValues.OnClientEvent:Connect(function(...)
+-- Общий обработчик для Replica remotes: патчит таблицы в args, логирует
+local function hookReplicaRemote(name, remote)
+    if not remote then return end
+    remote.OnClientEvent:Connect(function(...)
         local args = {...}
         local total = 0
-        for _, v in ipairs(args) do
+        for i, v in ipairs(args) do
             if type(v) == "table" then
                 total = total + patchTable(v)
             elseif isNaN(v) then
-                -- singleton value (e.g. path, value) — can't patch in-place, skip
+                log(name, "arg", i, "= NaN (singleton, can't patch)")
             end
         end
+        if LOG_REPLICA or total > 0 then
+            log(name, "fired | args:", #args, "| patched NaN:", total)
+        end
         if total > 0 then
-            print("[BannerPity Repair] Patched", total, "NaN in ReplicaSetValues payload")
+            warn("[BannerPity Repair] Patched", total, "NaN in", name)
         end
     end)
-    print("[BannerPity Repair] ReplicaSetValues hook active — NaN patched on receive")
+    log("Hooked", name)
+end
+
+-- Хук всех Replica remotes (данные могут идти через любой)
+local RemoteEvents = ReplicatedStorage:WaitForChild("RemoteEvents", 3)
+if not RemoteEvents then log("RemoteEvents not found — Replica hooks skipped") end
+local replicaRemotes = {
+    "ReplicaSet", "ReplicaSetValues", "ReplicaCreate", "ReplicaWrite",
+    "ReplicaTableInsert", "ReplicaTableRemove", "ReplicaRequestData", "ReplicaParent"
+}
+
+for _, rname in ipairs(replicaRemotes) do
+    local r = RemoteEvents and RemoteEvents:FindFirstChild(rname)
+    if r then hookReplicaRemote(rname, r) end
+end
+
+-- Хук RequestBannerSummon — санитизация ДО отправки (предотвращает баг)
+-- Требует hookfunction (Synapse/KRNL/Fluxus и др.)
+local Remotes = ReplicatedStorage:FindFirstChild("Remotes")
+local RequestBannerSummon = Remotes and Remotes:FindFirstChild("RequestBannerSummon")
+local hookfn = rawget(_G, "hookfunction")
+if type(hookfn) ~= "function" then hookfn = nil end
+if RequestBannerSummon and hookfn then
+    local orig = RequestBannerSummon.InvokeServer
+    hookfn(orig, function(self, ...)
+        local args = {...}
+        for i, v in ipairs(args) do
+            if isNaN(v) or (type(v) == "number" and (v ~= v or v == math.huge or v == -math.huge)) then
+                args[i] = 1
+                log("RequestBannerSummon: sanitized arg", i, "-> 1")
+                warn("[BannerPity Repair] RequestBannerSummon sanitized NaN/Inf")
+            end
+        end
+        return orig(self, unpack(args))
+    end)
+    log("Hooked RequestBannerSummon (hookfunction)")
+elseif RequestBannerSummon then
+    log("RequestBannerSummon NOT hooked (no hookfunction) — run repair BEFORE summon")
 end
 
 task.wait(1)
@@ -69,9 +113,27 @@ local function createNaNProxy(t)
     })
 end
 
+-- Способ E: скан _G на таблицы с BannerPity
+local function scanGlobalForBannerPity()
+    for k, v in pairs(_G) do
+        if type(v) == "table" and v.BannerPity then
+            local n = patchTable(v)
+            if n > 0 then
+                log("scanGlobal: patched", k, ":", n)
+                return n
+            end
+        end
+    end
+    return 0
+end
+
 local function repair()
+    log("repair() attempt")
+    -- Способ E: скан _G
+    if scanGlobalForBannerPity() > 0 then return true end
     local player = Players.LocalPlayer
     if not player or not player.UserId then
+        log("repair skip: LocalPlayer not ready")
         return false, "LocalPlayer not ready"
     end
 
@@ -103,12 +165,21 @@ local function repair()
                 return 0
             end
             if scan(mod, 0) > 0 then return true end
+            log("ReplicaClient scan: no BannerPity/ClientData found")
+        else
+            log("ReplicaClient require failed or nil")
         end
+    else
+        log("ReplicaClient not found (ps/rc)")
     end
 
-    if not ReplicaHandler then return false, "no ReplicaHandler" end
+    if not ReplicaHandler then
+        log("repair skip: no ReplicaHandler")
+        return false, "no ReplicaHandler"
+    end
     local ok, handler = pcall(require, ReplicaHandler)
     if not ok or not handler then
+        log("repair skip: ReplicaHandler require failed", ok and "nil" or handler)
         return false, "require failed"
     end
 
@@ -136,6 +207,7 @@ local function repair()
     if type(waitFn) == "function" then
         local ok, res = pcall(waitFn, handler, player)
         if not ok and res and tostring(res):find("UserId") then
+            log("repair skip: WaitForPlayerData UserId error —", tostring(res):sub(1, 60))
             return false, "ReplicaHandler needs game context (UserId nil) — use ReplicaSetValues hook"
         end
         if ok and res then pd = res end
@@ -148,6 +220,7 @@ local function repair()
         end
     end
     if not pd then
+        log("repair skip: no PlayerData from WaitForPlayerData")
         return false, "no PlayerData"
     end
 
@@ -193,6 +266,7 @@ local function repair()
         end
     end
 
+    log("repair: all methods failed (read-only)")
     return false, "read-only"
 end
 
@@ -217,4 +291,8 @@ task.spawn(function()
     end
 end)
 
-print("[BannerPity Repair] Started. Methods: direct patch, upvalue, proxy hook.")
+-- Startup summary
+log("=== Started ===")
+log("Replica hooks:", table.concat(replicaRemotes, ", "))
+log("RequestBannerSummon hook:", hookfn and "YES (hookfunction)" or "NO")
+log("Run BEFORE summon if already corrupted. Replica hooks log every event.")
