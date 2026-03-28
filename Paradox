@@ -1,2 +1,2 @@
-wait(10)
+wait(5)
 loadstring(game:HttpGet("https://raw.githubusercontent.com/ApelsinkaFr/ApelHub/refs/heads/main/ApelHub"))()
