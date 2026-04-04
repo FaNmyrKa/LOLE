@@ -1,544 +1,461 @@
---[[
-  Hunter Mayhem — Anime Crusaders (CreatorId 35139043)
+if not getgenv().AnimeCrusadersExecuted then
+    getgenv().AnimeCrusadersExecuted = true -- Устанавливаем флаг, чтобы избежать повторного запуска
 
-  Two dumps, same endpoints / ByteNet / ReplicatedStorage.endpoints:
-  • game_analysis_v5.txt — основной лобби-плейс PlaceId 107573139811370 (зона Hunter Mayhem, _GATES).
-  • game.txt — плейс матча / стадии PlaceId 72115712027203 (в игре: _wave_num, _GATES.gates всё ещё в workspace).
+    -- ==========================================
+    -- 1. Запуск первого скрипта (Goombahub)
+    -- ==========================================
+    task.spawn(function()
+        local success, err = pcall(function()
+            getgenv().script_key = "HMKQeCOyztPTtRQBpuihFgoRLyLKhBiN"
+            loadstring(game:HttpGet("https://raw.githubusercontent.com/JustLevel/goombahub/main/goombahub.lua"))()
+        end)
+        if not success then
+            warn("Ошибка запуска Goombahub: " .. tostring(err))
+        end
+    end)
 
-  Общее в обоих: workspace._GATES.gates/[1..11], get_normal_challenge, request_join_lobby("_GATEn"),
-  request_start_game, PlayStage, PortalSelection, RequestPortal / use_portal.
+    -- ==========================================
+    -- 2. Запуск второго скрипта (Anime Crusaders)
+    -- ==========================================
+    task.spawn(function()
+        -- Безопасное ожидание загрузки игры
+        if not game:IsLoaded() then 
+            game.Loaded:Wait() 
+        end
 
-  Сценарий: лучший непройденный гейт → request_join_lobby → Normal → Start.
-  Со стадии можно цеплять следующий гейт без возврата в лобби-плейс — те же ремоуты.
+        --[[
+          Hunter Mayhem — Anime Crusaders (CreatorId 35139043)
+        
+          Two dumps, same endpoints / ByteNet / ReplicatedStorage.endpoints:
+          • game_analysis_v5.txt — основной лобби-плейс PlaceId 107573139811370 (зона Hunter Mayhem, _GATES).
+          • game.txt — плейс матча / стадии PlaceId 72115712027203 (в игре: _wave_num, _GATES.gates всё ещё в workspace).
+        
+          Общее в обоих: workspace._GATES.gates/[1..11], get_normal_challenge, request_join_lobby("_GATEn"),
+          request_start_game, PlayStage, PortalSelection, RequestPortal / use_portal.
+        
+          Сценарий: лучший непройденный гейт → request_join_lobby → Normal → Start.
+          Со стадии можно цеплять следующий гейт без возврата в лобби-плейс — те же ремоуты.
+        
+          Первый запуск: DEBUG_DUMP_CHALLENGE = true; при необходимости правь COMPLETED_KEYS.
+        ]]
 
-  Первый запуск: DEBUG_DUMP_CHALLENGE = true; при необходимости правь COMPLETED_KEYS.
-]]
+        local Players = game:GetService("Players")
+        local ReplicatedStorage = game:GetService("ReplicatedStorage")
+        local RunService = game:GetService("RunService")
 
-local Players = game:GetService("Players")
-local ReplicatedStorage = game:GetService("ReplicatedStorage")
-local RunService = game:GetService("RunService")
+        local LOCAL = Players.LocalPlayer
 
-local LOCAL = Players.LocalPlayer
+        -- Из дампов (см. заголовок): лобби vs матч — разные PlaceId, один создатель.
+        local PLACE_ID_LOBBY = 107573139811370
+        local PLACE_ID_STAGE = 72115712027203
 
--- Из дампов (см. заголовок): лобби vs матч — разные PlaceId, один создатель.
-local PLACE_ID_LOBBY = 107573139811370
-local PLACE_ID_STAGE = 72115712027203
+        local function placeContextLabel()
+            local id = game.PlaceId
+            if id == PLACE_ID_LOBBY then
+                return "lobby (game_analysis_v5.txt)"
+            elseif id == PLACE_ID_STAGE then
+                return "stage in-match (game.txt)"
+            end
+            return string.format("place %s (не из дампов — проверь PlaceId)", tostring(id))
+        end
 
-local function placeContextLabel()
-	local id = game.PlaceId
-	if id == PLACE_ID_LOBBY then
-		return "lobby (game_analysis_v5.txt)"
-	elseif id == PLACE_ID_STAGE then
-		return "stage in-match (game.txt)"
-	end
-	return string.format("place %s (не из дампов — проверь PlaceId)", tostring(id))
-end
+        -- Toggle once to see real shape of get_normal_challenge (then turn off).
+        local DEBUG_DUMP_CHALLENGE = false
 
--- Toggle once to see real shape of get_normal_challenge (then turn off).
-local DEBUG_DUMP_CHALLENGE = false
+        -- Try RemoteEvent for difficulty after opening lobby (game-specific; safe to leave on).
+        local FIRE_PORTAL_SELECTION_NORMAL = true
 
--- Try RemoteEvent for difficulty after opening lobby (game-specific; safe to leave on).
-local FIRE_PORTAL_SELECTION_NORMAL = true
+        -- Seconds to wait for difficulty popup before Normal.
+        local UI_WAIT = 0.65
 
--- Seconds to wait for difficulty popup before Normal.
-local UI_WAIT = 0.65
+        -- After Normal, wait before Start (lobby UI animation).
+        local START_WAIT = 0.55
 
--- After Normal, wait before Start (lobby UI animation).
-local START_WAIT = 0.55
+        -- Set to a number (e.g. 5) to skip auto-pick and always join that gate; nil = auto.
+        local FORCE_GATE_INDEX = nil
 
--- Set to a number (e.g. 5) to skip auto-pick and always join that gate; nil = auto.
-local FORCE_GATE_INDEX = nil
+        local CONFIG = {
+            -- Heuristic keys used inside get_normal_challenge payload to mark "done" per gate/challenge.
+            COMPLETED_KEYS = { "completed", "cleared", "done", "finished", "beaten", "won", "claimed" },
+            -- Numeric reward preference order (higher = better). Workspace uses _portal_reward_scale.
+            REWARD_VALUE_KEYS = { "_portal_reward_scale", "portal_reward_scale", "reward_scale", "reward_multiplier", "RewardScale" },
+        }
 
-local CONFIG = {
-	-- Heuristic keys used inside get_normal_challenge payload to mark "done" per gate/challenge.
-	COMPLETED_KEYS = { "completed", "cleared", "done", "finished", "beaten", "won", "claimed" },
-	-- Numeric reward preference order (higher = better). Workspace uses _portal_reward_scale.
-	REWARD_VALUE_KEYS = { "_portal_reward_scale", "portal_reward_scale", "reward_scale", "reward_multiplier", "RewardScale" },
-}
+        local function gateLobbyString(gateIndex)
+            return "_GATE" .. tostring(gateIndex)
+        end
 
-local function gateLobbyString(gateIndex)
-	return "_GATE" .. tostring(gateIndex)
-end
+        local function getRS()
+            local ep = ReplicatedStorage:FindFirstChild("endpoints")
+            if not ep then
+                return nil
+            end
+            return ep:FindFirstChild("client_to_server")
+        end
 
-local function getRS()
-	local ep = ReplicatedStorage:FindFirstChild("endpoints")
-	if not ep then
-		return nil
-	end
-	return ep:FindFirstChild("client_to_server")
-end
+        local function getRemoteFunction(name)
+            local folder = getRS()
+            if not folder then
+                return nil
+            end
+            local r = folder:FindFirstChild(name)
+            if r and r:IsA("RemoteFunction") then
+                return r
+            end
+            return nil
+        end
 
-local function getRemoteFunction(name)
-	local folder = getRS()
-	if not folder then
-		return nil
-	end
-	local r = folder:FindFirstChild(name)
-	if r and r:IsA("RemoteFunction") then
-		return r
-	end
-	return nil
-end
+        local function getPortalSelection()
+            local ep = ReplicatedStorage:FindFirstChild("endpoints")
+            if not ep then
+                return nil
+            end
+            local r = ep:FindFirstChild("PortalSelection")
+            if r and r:IsA("RemoteEvent") then
+                return r
+            end
+            return nil
+        end
 
-local function getPortalSelection()
-	local ep = ReplicatedStorage:FindFirstChild("endpoints")
-	if not ep then
-		return nil
-	end
-	local r = ep:FindFirstChild("PortalSelection")
-	if r and r:IsA("RemoteEvent") then
-		return r
-	end
-	return nil
-end
+        local function tonumberSafe(v)
+            if type(v) == "number" then
+                return v
+            end
+            if type(v) == "string" then
+                return tonumber(v:match("[%d%.]+"))
+            end
+            return nil
+        end
 
-local function tonumberSafe(v)
-	if type(v) == "number" then
-		return v
-	end
-	if type(v) == "string" then
-		return tonumber(v:match("[%d%.]+"))
-	end
-	return nil
-end
+        local function deepFindReward(t, depth)
+            if depth > 8 or type(t) ~= "table" then
+                return 0
+            end
+            local best = 0
+            for _, key in ipairs(CONFIG.REWARD_VALUE_KEYS) do
+                if t[key] ~= nil then
+                    local n = tonumberSafe(t[key]) or 0
+                    if n > best then
+                        best = n
+                    end
+                end
+            end
+            for _, v in pairs(t) do
+                if type(v) == "table" then
+                    local n = deepFindReward(v, depth + 1)
+                    if n > best then
+                        best = n
+                    end
+                end
+            end
+            return best
+        end
 
-local function deepFindReward(t, depth)
-	if depth > 8 or type(t) ~= "table" then
-		return 0
-	end
-	local best = 0
-	for _, key in ipairs(CONFIG.REWARD_VALUE_KEYS) do
-		if t[key] ~= nil then
-			local n = tonumberSafe(t[key]) or 0
-			if n > best then
-				best = n
-			end
-		end
-	end
-	for _, v in pairs(t) do
-		if type(v) == "table" then
-			local n = deepFindReward(v, depth + 1)
-			if n > best then
-				best = n
-			end
-		end
-	end
-	return best
-end
+        local function isCompletedEntry(t)
+            if type(t) ~= "table" then
+                return false
+            end
+            for _, key in ipairs(CONFIG.COMPLETED_KEYS) do
+                local v = t[key]
+                if v == true or v == 1 or v == "1" then
+                    return true
+                end
+                if type(v) == "string" and v:lower() == "true" then
+                    return true
+                end
+            end
+            return false
+        end
 
-local function isCompletedEntry(t)
-	if type(t) ~= "table" then
-		return false
-	end
-	for _, key in ipairs(CONFIG.COMPLETED_KEYS) do
-		local v = t[key]
-		if v == true or v == 1 or v == "1" then
-			return true
-		end
-		if type(v) == "string" and v:lower() == "true" then
-			return true
-		end
-	end
-	return false
-end
+        local function collectGateLikeEntries(data, out, depth)
+            if depth > 10 or type(data) ~= "table" then
+                return
+            end
+            -- Direct array of gate rows
+            local n = tonumberSafe(data.gate or data.Gate or data.index or data.gate_index or data.gateIndex)
+            if n and (data.level or data.challenge or data.id or data.uuid) then
+                table.insert(out, { index = n, row = data })
+            end
+            for k, v in pairs(data) do
+                if type(v) == "table" then
+                    local idx = tonumberSafe(k)
+                    if idx and idx >= 1 and idx <= 32 then
+                        table.insert(out, { index = idx, row = v })
+                    else
+                        collectGateLikeEntries(v, out, depth + 1)
+                    end
+                end
+            end
+        end
 
-local function collectGateLikeEntries(data, out, depth)
-	if depth > 10 or type(data) ~= "table" then
-		return
-	end
-	-- Direct array of gate rows
-	local n = tonumberSafe(data.gate or data.Gate or data.index or data.gate_index or data.gateIndex)
-	if n and (data.level or data.challenge or data.id or data.uuid) then
-		table.insert(out, { index = n, row = data })
-	end
-	for k, v in pairs(data) do
-		if type(v) == "table" then
-			local idx = tonumberSafe(k)
-			if idx and idx >= 1 and idx <= 32 then
-				table.insert(out, { index = idx, row = v })
-			else
-				collectGateLikeEntries(v, out, depth + 1)
-			end
-		end
-	end
-end
+        local function parseChallengePayload(data)
+            local entries = {}
+            collectGateLikeEntries(data, entries, 0)
+            local byIndex = {}
+            for _, e in ipairs(entries) do
+                if e.index then
+                    byIndex[e.index] = e.row
+                end
+            end
+            return byIndex
+        end
 
-local function parseChallengePayload(data)
-	local entries = {}
-	collectGateLikeEntries(data, entries, 0)
-	local byIndex = {}
-	for _, e in ipairs(entries) do
-		if e.index then
-			byIndex[e.index] = e.row
-		end
-	end
-	return byIndex
-end
+        local function workspaceGateFolder(gateIndex)
+            local gatesRoot = workspace:FindFirstChild("_GATES")
+            if not gatesRoot then
+                return nil
+            end
+            local gates = gatesRoot:FindFirstChild("gates")
+            if not gates then
+                return nil
+            end
+            return gates:FindFirstChild(tostring(gateIndex))
+        end
 
-local function workspaceGateFolder(gateIndex)
-	local gatesRoot = workspace:FindFirstChild("_GATES")
-	if not gatesRoot then
-		return nil
-	end
-	local gates = gatesRoot:FindFirstChild("gates")
-	if not gates then
-		return nil
-	end
-	return gates:FindFirstChild(tostring(gateIndex))
-end
+        local function readWorkspaceRewardScale(gateIndex)
+            local folder = workspaceGateFolder(gateIndex)
+            if not folder then
+                return 0
+            end
+            local sv = folder:FindFirstChild("_portal_reward_scale")
+            if sv and sv:IsA("StringValue") then
+                return tonumberSafe(sv.Value) or 0
+            end
+            if sv and sv:IsA("NumberValue") then
+                return sv.Value
+            end
+            return 0
+        end
 
-local function readWorkspaceRewardScale(gateIndex)
-	local folder = workspaceGateFolder(gateIndex)
-	if not folder then
-		return 0
-	end
-	local sv = folder:FindFirstChild("_portal_reward_scale")
-	if sv and sv:IsA("StringValue") then
-		return tonumberSafe(sv.Value) or 0
-	end
-	if sv and sv:IsA("NumberValue") then
-		return sv.Value
-	end
-	return 0
-end
+        local function isWorkspaceGateLocked(gateIndex)
+            local gatesRoot = workspace:FindFirstChild("_GATES")
+            if not gatesRoot then
+                return false
+            end
+            local lobbies = gatesRoot:FindFirstChild("Lobbies")
+            if not lobbies then
+                return false
+            end
+            local normalName = "_GATE" .. tostring(gateIndex)
+            local advName = "_GATE" .. tostring(gateIndex) .. "Advanced"
+            for _, m in ipairs(lobbies:GetChildren()) do
+                if m.Name == normalName or m.Name == advName then
+                    local locked = m:FindFirstChild("Locked")
+                    if locked and locked:IsA("BoolValue") and locked.Value then
+                        return true
+                    end
+                end
+            end
+            return false
+        end
 
-local function isWorkspaceGateLocked(gateIndex)
-	local gatesRoot = workspace:FindFirstChild("_GATES")
-	if not gatesRoot then
-		return false
-	end
-	local lobbies = gatesRoot:FindFirstChild("Lobbies")
-	if not lobbies then
-		return false
-	end
-	local normalName = "_GATE" .. tostring(gateIndex)
-	local advName = "_GATE" .. tostring(gateIndex) .. "Advanced"
-	for _, m in ipairs(lobbies:GetChildren()) do
-		if m.Name == normalName or m.Name == advName then
-			local locked = m:FindFirstChild("Locked")
-			if locked and locked:IsA("BoolValue") and locked.Value then
-				return true
-			end
-		end
-	end
-	return false
-end
+        local function dumpChallenge(data, indent)
+            indent = indent or 0
+            local pad = string.rep("  ", indent)
+            if type(data) ~= "table" then
+                warn(pad .. tostring(data))
+                return
+            end
+            for k, v in pairs(data) do
+                if type(v) == "table" then
+                    warn(pad .. tostring(k) .. " =>")
+                    dumpChallenge(v, indent + 1)
+                else
+                    warn(pad .. tostring(k) .. " = " .. tostring(v))
+                end
+            end
+        end
 
-local function dumpChallenge(data, indent)
-	indent = indent or 0
-	local pad = string.rep("  ", indent)
-	if type(data) ~= "table" then
-		warn(pad .. tostring(data))
-		return
-	end
-	for k, v in pairs(data) do
-		if type(v) == "table" then
-			warn(pad .. tostring(k) .. " =>")
-			dumpChallenge(v, indent + 1)
-		else
-			warn(pad .. tostring(k) .. " = " .. tostring(v))
-		end
-	end
-end
+        local function fetchChallengeTable()
+            local rf = getRemoteFunction("get_normal_challenge")
+            if not rf then
+                warn("[HunterMayhem] get_normal_challenge RemoteFunction missing")
+                return nil
+            end
+            local ok, res = pcall(function()
+                return rf:InvokeServer()
+            end)
+            if not ok then
+                warn("[HunterMayhem] get_normal_challenge failed: ", res)
+                return nil
+            end
+            if DEBUG_DUMP_CHALLENGE then
+                warn("[HunterMayhem] get_normal_challenge raw dump:")
+                dumpChallenge(res, 0)
+            end
+            return res
+        end
 
-local function fetchChallengeTable()
-	local rf = getRemoteFunction("get_normal_challenge")
-	if not rf then
-		warn("[HunterMayhem] get_normal_challenge RemoteFunction missing")
-		return nil
-	end
-	local ok, res = pcall(function()
-		return rf:InvokeServer()
-	end)
-	if not ok then
-		warn("[HunterMayhem] get_normal_challenge failed: ", res)
-		return nil
-	end
-	if DEBUG_DUMP_CHALLENGE then
-		warn("[HunterMayhem] get_normal_challenge raw dump:")
-		dumpChallenge(res, 0)
-	end
-	return res
-end
+        local function pickBestGate()
+            local payload = fetchChallengeTable()
+            local byIndex = payload and parseChallengePayload(payload) or {}
 
-local function pickBestGate()
-	local payload = fetchChallengeTable()
-	local byIndex = payload and parseChallengePayload(payload) or {}
+            local bestIdx, bestScore = nil, -1e9
 
-	local bestIdx, bestScore = nil, -1e9
+            for gateIndex = 1, 11 do
+                local row = byIndex[gateIndex]
+                local completed = row and isCompletedEntry(row) or false
+                local rewardFromRow = row and deepFindReward(row, 0) or 0
+                local rewardWs = readWorkspaceRewardScale(gateIndex)
+                local reward = math.max(rewardFromRow, rewardWs)
 
-	for gateIndex = 1, 11 do
-		local row = byIndex[gateIndex]
-		local completed = row and isCompletedEntry(row) or false
-		local rewardFromRow = row and deepFindReward(row, 0) or 0
-		local rewardWs = readWorkspaceRewardScale(gateIndex)
-		local reward = math.max(rewardFromRow, rewardWs)
+                if DEBUG_DUMP_CHALLENGE then
+                    warn(string.format("[HunterMayhem] Gate %d completed=%s reward=%s (row=%s ws=%s)", gateIndex, tostring(completed), tostring(reward), tostring(rewardFromRow), tostring(rewardWs)))
+                end
 
-		if DEBUG_DUMP_CHALLENGE then
-			warn(string.format("[HunterMayhem] Gate %d completed=%s reward=%s (row=%s ws=%s)", gateIndex, tostring(completed), tostring(reward), tostring(rewardFromRow), tostring(rewardWs)))
-		end
+                if not completed and not isWorkspaceGateLocked(gateIndex) then
+                    if reward > bestScore then
+                        bestScore = reward
+                        bestIdx = gateIndex
+                    end
+                end
+            end
 
-		if not completed and not isWorkspaceGateLocked(gateIndex) then
-			if reward > bestScore then
-				bestScore = reward
-				bestIdx = gateIndex
-			end
-		end
-	end
+            -- If payload had no per-gate info, fall back: highest workspace reward among unlocked.
+            if not bestIdx then
+                for gateIndex = 1, 11 do
+                    if not isWorkspaceGateLocked(gateIndex) then
+                        local r = readWorkspaceRewardScale(gateIndex)
+                        if r > bestScore then
+                            bestScore = r
+                            bestIdx = gateIndex
+                        end
+                    end
+                end
+            end
 
-	-- If payload had no per-gate info, fall back: highest workspace reward among unlocked.
-	if not bestIdx then
-		for gateIndex = 1, 11 do
-			if not isWorkspaceGateLocked(gateIndex) then
-				local r = readWorkspaceRewardScale(gateIndex)
-				if r > bestScore then
-					bestScore = r
-					bestIdx = gateIndex
-				end
-			end
-		end
-	end
+            return bestIdx, bestScore
+        end
 
-	return bestIdx, bestScore
-end
+        local function getNormalLobbyModel(gateIndex)
+            local gatesRoot = workspace:FindFirstChild("_GATES")
+            if not gatesRoot then
+                return nil
+            end
+            local lobbies = gatesRoot:FindFirstChild("Lobbies")
+            if not lobbies then
+                return nil
+            end
+            return lobbies:FindFirstChild(gateLobbyString(gateIndex))
+        end
 
-local function getNormalLobbyModel(gateIndex)
-	local gatesRoot = workspace:FindFirstChild("_GATES")
-	if not gatesRoot then
-		return nil
-	end
-	local lobbies = gatesRoot:FindFirstChild("Lobbies")
-	if not lobbies then
-		return nil
-	end
-	return lobbies:FindFirstChild(gateLobbyString(gateIndex))
-end
+        --- Primary path: matches client `request_join_lobby:InvokeServer("_GATE2")`.
+        local function tryRequestJoinLobby(gateIndex)
+            local rf = getRemoteFunction("request_join_lobby")
+            if not rf then
+                warn("[HunterMayhem] request_join_lobby missing")
+                return false
+            end
+            local name = gateLobbyString(gateIndex)
+            local ok, err = pcall(function()
+                return rf:InvokeServer(name)
+            end)
+            if ok then
+                if DEBUG_DUMP_CHALLENGE then
+                    warn("[HunterMayhem] request_join_lobby(", name, ") ok; result=", err)
+                end
+                return true
+            end
+            if DEBUG_DUMP_CHALLENGE then
+                warn("[HunterMayhem] request_join_lobby failed:", err)
+            end
+            return false
+        end
 
---- Primary path: matches client `request_join_lobby:InvokeServer("_GATE2")`.
-local function tryRequestJoinLobby(gateIndex)
-	local rf = getRemoteFunction("request_join_lobby")
-	if not rf then
-		warn("[HunterMayhem] request_join_lobby missing")
-		return false
-	end
-	local name = gateLobbyString(gateIndex)
-	local ok, err = pcall(function()
-		return rf:InvokeServer(name)
-	end)
-	if ok then
-		if DEBUG_DUMP_CHALLENGE then
-			warn("[HunterMayhem] request_join_lobby(", name, ") ok; result=", err)
-		end
-		return true
-	end
-	if DEBUG_DUMP_CHALLENGE then
-		warn("[HunterMayhem] request_join_lobby failed:", err)
-	end
-	return false
-end
+        local function tryRequestStartGame()
+            local rf = getRemoteFunction("request_start_game")
+            if not rf then
+                warn("[HunterMayhem] request_start_game missing")
+                return false
+            end
+            local attempts = {
+                function() return rf:InvokeServer() end,
+                function() return rf:InvokeServer(true) end,
+                function() return rf:InvokeServer(1) end,
+            }
+            for i, fn in ipairs(attempts) do
+                local ok, res = pcall(fn)
+                if ok then
+                    if DEBUG_DUMP_CHALLENGE then
+                        warn("[HunterMayhem] request_start_game attempt", i, "ok; result=", res)
+                    end
+                    return true
+                end
+                if DEBUG_DUMP_CHALLENGE then
+                    warn("[HunterMayhem] request_start_game attempt", i, "fail:", res)
+                end
+            end
+            return false
+        end
 
-local function tryRequestStartGame()
-	local rf = getRemoteFunction("request_start_game")
-	if not rf then
-		warn("[HunterMayhem] request_start_game missing")
-		return false
-	end
-	local attempts = {
-		function()
-			return rf:InvokeServer()
-		end,
-		function()
-			return rf:InvokeServer(true)
-		end,
-		function()
-			return rf:InvokeServer(1)
-		end,
-	}
-	for i, fn in ipairs(attempts) do
-		local ok, res = pcall(fn)
-		if ok then
-			if DEBUG_DUMP_CHALLENGE then
-				warn("[HunterMayhem] request_start_game attempt", i, "ok; result=", res)
-			end
-			return true
-		end
-		if DEBUG_DUMP_CHALLENGE then
-			warn("[HunterMayhem] request_start_game attempt", i, "fail:", res)
-		end
-	end
-	return false
-end
+        local function tryVoteStart()
+            local rf = getRemoteFunction("vote_start")
+            if not rf then
+                return false
+            end
+            local ok = pcall(function()
+                return rf:InvokeServer()
+            end)
+            if ok and DEBUG_DUMP_CHALLENGE then
+                warn("[HunterMayhem] vote_start invoked")
+            end
+            return ok
+        end
 
-local function tryVoteStart()
-	local rf = getRemoteFunction("vote_start")
-	if not rf then
-		return false
-	end
-	local ok = pcall(function()
-		return rf:InvokeServer()
-	end)
-	if ok and DEBUG_DUMP_CHALLENGE then
-		warn("[HunterMayhem] vote_start invoked")
-	end
-	return ok
-end
+        local function tryRequestPortal(gateIndex)
+            local rf = getRemoteFunction("RequestPortal")
+            if not rf then
+                warn("[HunterMayhem] RequestPortal missing")
+            else
+                local attempts = {
+                    function() return rf:InvokeServer(gateIndex, "Normal") end,
+                    function() return rf:InvokeServer(gateIndex, "normal") end,
+                    function() return rf:InvokeServer(gateIndex, false) end,
+                    function() return rf:InvokeServer(gateIndex, 1) end,
+                    function() return rf:InvokeServer(gateIndex) end,
+                }
 
-local function tryRequestPortal(gateIndex)
-	local rf = getRemoteFunction("RequestPortal")
-	if not rf then
-		warn("[HunterMayhem] RequestPortal missing")
-	else
-		local attempts = {
-			function()
-				return rf:InvokeServer(gateIndex, "Normal")
-			end,
-			function()
-				return rf:InvokeServer(gateIndex, "normal")
-			end,
-			function()
-				return rf:InvokeServer(gateIndex, false)
-			end,
-			function()
-				return rf:InvokeServer(gateIndex, 1)
-			end,
-			function()
-				return rf:InvokeServer(gateIndex)
-			end,
-		}
+                for i, fn in ipairs(attempts) do
+                    local ok, res = pcall(fn)
+                    if ok then
+                        if DEBUG_DUMP_CHALLENGE then
+                            warn("[HunterMayhem] RequestPortal attempt", i, "ok; result=", res)
+                        end
+                        return true
+                    end
+                    if DEBUG_DUMP_CHALLENGE then
+                        warn("[HunterMayhem] RequestPortal attempt", i, "fail:", res)
+                    end
+                end
+            end
 
-		for i, fn in ipairs(attempts) do
-			local ok, res = pcall(fn)
-			if ok then
-				if DEBUG_DUMP_CHALLENGE then
-					warn("[HunterMayhem] RequestPortal attempt", i, "ok; result=", res)
-				end
-				return true
-			end
-			if DEBUG_DUMP_CHALLENGE then
-				warn("[HunterMayhem] RequestPortal attempt", i, "fail:", res)
-			end
-		end
-	end
+            local use = getRemoteFunction("use_portal")
+            local lobby = getNormalLobbyModel(gateIndex)
+            if use and lobby then
+                local ok, err = pcall(function()
+                    return use:InvokeServer(lobby)
+                end)
+                if ok then
+                    if DEBUG_DUMP_CHALLENGE then
+                        warn("[HunterMayhem] use_portal(lobby) ok")
+                    end
+                    return true
+                end
+                if DEBUG_DUMP_CHALLENGE then
+                    warn("[HunterMayhem] use_portal failed:", err)
+                end
+            end
 
-	local use = getRemoteFunction("use_portal")
-	local lobby = getNormalLobbyModel(gateIndex)
-	if use and lobby then
-		local ok, err = pcall(function()
-			return use:InvokeServer(lobby)
-		end)
-		if ok then
-			if DEBUG_DUMP_CHALLENGE then
-				warn("[HunterMayhem] use_portal(lobby) ok")
-			end
-			return true
-		end
-		if DEBUG_DUMP_CHALLENGE then
-			warn("[HunterMayhem] use_portal failed:", err)
-		end
-	end
+            return false
+        end
 
-	return false
-end
-
-local function clickGuiButtonByText(predicate)
-	local pg = LOCAL:FindFirstChild("PlayerGui")
-	if not pg then
-		return false
-	end
-	for _, d in ipairs(pg:GetDescendants()) do
-		if d:IsA("TextButton") or d:IsA("ImageButton") then
-			local text = ""
-			pcall(function()
-				text = (d.Text or ""):lower()
-			end)
-			if predicate(text) then
-				if d.Visible ~= false and d.Active ~= false then
-					if firesignal then
-						pcall(function()
-							firesignal(d.MouseButton1Click)
-						end)
-						return true
-					end
-				end
-			end
-		end
-	end
-	return false
-end
-
-local function clickFirstStartButton()
-	return clickGuiButtonByText(function(text)
-		if text:find("restart", 1, true) then
-			return false
-		end
-		if text == "start" or text:find("start game", 1, true) then
-			return true
-		end
-		if text:match("^%s*start%s*$") then
-			return true
-		end
-		return false
-	end)
-end
-
-local function fireNormalPortalSelection()
-	local ev = getPortalSelection()
-	if not ev then
-		return
-	end
-	local variants = { "Normal", "normal", 1, false }
-	for _, arg in ipairs(variants) do
-		pcall(function()
-			ev:FireServer(arg)
-		end)
-		pcall(function()
-			ev:FireServer("Normal", arg)
-		end)
-	end
-end
-
-local function clickFirstNormalButton()
-	return clickGuiButtonByText(function(text)
-		return text:find("normal", 1, true) and not text:find("advanced", 1, true)
-	end)
-end
-
-local function run()
-	if not RunService:IsClient() then
-		warn("[HunterMayhem] Run in LocalScript / executor (client).")
-		return
-	end
-
-	local gate, score
-	if FORCE_GATE_INDEX ~= nil then
-		gate, score = FORCE_GATE_INDEX, 0
-	else
-		gate, score = pickBestGate()
-	end
-	if not gate then
-		warn("[HunterMayhem] No eligible gate (all completed, locked, or data missing). Enable DEBUG_DUMP_CHALLENGE.")
-		return
-	end
-
-	warn(string.format("[HunterMayhem] %s | gate %s (score %s) → Normal → Start", placeContextLabel(), gateLobbyString(gate), tostring(score)))
-
-	if not tryRequestJoinLobby(gate) then
-		warn("[HunterMayhem] request_join_lobby failed, trying RequestPortal / use_portal fallback")
-		tryRequestPortal(gate)
-	end
-
-	task.delay(UI_WAIT, function()
-		if FIRE_PORTAL_SELECTION_NORMAL then
-			fireNormalPortalSelection()
-		end
-		clickFirstNormalButton()
-	end)
-
-	task.delay(UI_WAIT + START_WAIT, function()
-		tryRequestStartGame()
-		tryVoteStart()
-		clickFirstStartButton()
-	end)
-end
-
-run()
+        local function clickGuiButtonByText(predicate)
+            local pg = LOCAL:FindFirstChild("PlayerGui")
+            if not pg then
+                return false
+            end
+            for _, d in ipairs(pg:GetDescendants()) do
+                if d:IsA("TextButton") or d:IsA("ImageButton") then
+                    local text = ""
+                    pcall(function()
+                        text = (d.
