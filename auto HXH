@@ -1,6 +1,3 @@
-if not game:IsLoaded() then
-    game.Loaded:Wait()
-end
 --[[
   Hunter Mayhem — Anime Crusaders
   Auto Gate: pick best gate → join → start → wait finish → next gate → repeat
@@ -118,15 +115,17 @@ local function invoke(name, ...)
 end
 
 -----------------------------------------------------------------------
--- CONTEXT DETECTION
+-- CONTEXT DETECTION (by PlaceId — workspace children unreliable)
 -----------------------------------------------------------------------
+local PLACE_ID_LOBBY = 107573139811370
+local PLACE_ID_STAGE = 72115712027203
+
 local function isLobby()
-	return workspace:FindFirstChild("_GATES")
-		and workspace._GATES:FindFirstChild("Lobbies") ~= nil
+	return game.PlaceId == PLACE_ID_LOBBY
 end
 
 local function isStage()
-	return workspace:FindFirstChild("_wave_num") ~= nil
+	return game.PlaceId == PLACE_ID_STAGE
 end
 
 -----------------------------------------------------------------------
@@ -391,7 +390,8 @@ local function main()
 		-- запускался заново на стадии.
 
 	else
-		warn("[HM] Неизвестный контекст. PlaceId:", game.PlaceId)
+		warn("[HM] Неизвестный PlaceId:", game.PlaceId)
+		warn("[HM] Ожидал lobby=" .. PLACE_ID_LOBBY .. " или stage=" .. PLACE_ID_STAGE)
 		warn("[HM] Пробую stage listener на всякий случай...")
 		setupAutoNext()
 	end
