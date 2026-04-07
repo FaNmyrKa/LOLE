@@ -7,7 +7,427 @@
 
   Общее в обоих: workspace._GATES.gates/[1..11], get_normal_challenge, request_join_lobby("_GATEn"),
   request_start_game, PlayStage, PortalSelection, RequestPortal / use_portal.
+--[[
+  Hunter Mayhem — Anime Crusaders
+  Auto Gate: pick best gate → join → start → wait finish → next gate → repeat
 
+  ВАЖНО: все endpoint вызовы идут через EndpointsClient.invoke_server(),
+  который оборачивает аргументы в Compress.CreatePacket().
+  Без этого сервер не принимает запросы.
+
+  workspace._GATES.gates/[1..11] доступен и в лобби, и на стадии.
+  Челлендж читается из gates/N/current_challenge (StringValue).
+  GateUuid для set_game_finished_vote = номер гейта (1-11).
+]]
+
+-- Kill previous
+if getgenv()._HM_Stop then
+	pcall(getgenv()._HM_Stop)
+end
+getgenv()._HM_Running = true
+getgenv()._HM_Stop = function()
+	getgenv()._HM_Running = false
+end
+
+local Players = game:GetService("Players")
+local RS = game:GetService("ReplicatedStorage")
+local LP = Players.LocalPlayer
+
+-----------------------------------------------------------------------
+-- SETTINGS
+-----------------------------------------------------------------------
+local DEBUG         = true     -- подробный вывод в консоль
+local LOOP          = true     -- повторять после завершения матча
+local GATE_DELAY    = 2.5      -- пауза после game_finished перед next gate (сек)
+local JOIN_WAIT     = 0.6      -- пауза после join перед lock/start
+local MAX_GATE      = 11
+local FORCE_GATE    = nil      -- число 1-11 для принудительного гейта, nil = авто
+
+-- Челленджи которые ПРОПУСКАЕМ
+local CHALLENGE_BLACKLIST = {
+	["triple_cost"]  = true,
+	["double_cost"]  = true,
+	-- ["short_range"]      = true,
+	-- ["godspeed_enemies"] = true,
+	-- ["shield_enemies"]   = true,
+	-- ["flying_enemies"]   = true,
+	-- ["regen_enemies"]    = true,
+	-- ["tank_enemies"]     = true,
+	-- ["fast_enemies"]     = true,
+}
+
+-----------------------------------------------------------------------
+-- FIND EndpointsClient FROM GAME MEMORY (getgc)
+-----------------------------------------------------------------------
+local EndpointsClient
+
+local function findEndpointsClient()
+	if EndpointsClient then return true end
+
+	-- Primary: invoke_server + connect_endpoint + ENDPOINT_FOLDER
+	for _, v in pairs(getgc(true)) do
+		if type(v) == "table"
+			and rawget(v, "invoke_server")
+			and rawget(v, "connect_endpoint")
+			and rawget(v, "ENDPOINT_FOLDER") then
+			EndpointsClient = v
+			return true
+		end
+	end
+
+	-- Fallback: invoke_server + Compress
+	for _, v in pairs(getgc(true)) do
+		if type(v) == "table"
+			and rawget(v, "invoke_server")
+			and rawget(v, "Compress") then
+			EndpointsClient = v
+			return true
+		end
+	end
+
+	return false
+end
+
+-- Ждём загрузку (до 15 сек)
+for attempt = 1, 30 do
+	if findEndpointsClient() then break end
+	if attempt == 30 then
+		warn("[HM] EndpointsClient не найден после 15 сек. Игра не загрузилась?")
+		return
+	end
+	task.wait(0.5)
+end
+warn("[HM] EndpointsClient OK")
+
+-----------------------------------------------------------------------
+-- SAFE INVOKE (through Compress.CreatePacket)
+-----------------------------------------------------------------------
+local function invoke(name, ...)
+	if not EndpointsClient then return nil end
+	local args = { ... }
+	local ok, res = pcall(function()
+		return EndpointsClient.invoke_server(name, unpack(args))
+	end)
+	if DEBUG then
+		local argStr = ""
+		for i, a in ipairs(args) do
+			if i > 1 then argStr = argStr .. ", " end
+			argStr = argStr .. tostring(a)
+		end
+		if ok then
+			warn(string.format("[HM] %s(%s) → %s", name, argStr, tostring(res)))
+		else
+			warn(string.format("[HM] %s(%s) FAIL: %s", name, argStr, tostring(res)))
+		end
+	end
+	return ok and res or nil
+end
+
+-----------------------------------------------------------------------
+-- CONTEXT DETECTION
+-----------------------------------------------------------------------
+local function isLobby()
+	return workspace:FindFirstChild("_GATES")
+		and workspace._GATES:FindFirstChild("Lobbies") ~= nil
+end
+
+local function isStage()
+	return workspace:FindFirstChild("_wave_num") ~= nil
+end
+
+-----------------------------------------------------------------------
+-- READ GATE INFO (works in both lobby and stage)
+-----------------------------------------------------------------------
+local function getGatesFolder()
+	local g = workspace:FindFirstChild("_GATES")
+	return g and g:FindFirstChild("gates")
+end
+
+local function getLobbiesFolder()
+	local g = workspace:FindFirstChild("_GATES")
+	return g and g:FindFirstChild("Lobbies")
+end
+
+local function readStringValue(parent, childName)
+	if not parent then return nil end
+	local sv = parent:FindFirstChild(childName)
+	if not sv then return nil end
+	local ok, val = pcall(function() return sv.Value end)
+	if ok and val ~= nil and val ~= "" then
+		return tostring(val)
+	end
+	return nil
+end
+
+local function readNumberValue(parent, childName)
+	if not parent then return 0 end
+	local sv = parent:FindFirstChild(childName)
+	if not sv then return 0 end
+	local ok, val = pcall(function() return sv.Value end)
+	if not ok then return 0 end
+	if type(val) == "number" then return val end
+	return tonumber(tostring(val)) or 0
+end
+
+local function readBoolValue(parent, childName)
+	if not parent then return false end
+	local sv = parent:FindFirstChild(childName)
+	if not sv then return false end
+	local ok, val = pcall(function() return sv.Value end)
+	return ok and val == true
+end
+
+--- Challenge гейта. Два источника: gates/N и Lobbies/_GATEn.
+local function getGateChallenge(gateIndex)
+	-- Источник 1: gates info folder (есть и в лобби, и на стадии)
+	local gatesFolder = getGatesFolder()
+	if gatesFolder then
+		local info = gatesFolder:FindFirstChild(tostring(gateIndex))
+		local ch = readStringValue(info, "current_challenge")
+		if ch then return ch:lower() end
+	end
+
+	-- Источник 2: lobby model (только в лобби)
+	local lobbies = getLobbiesFolder()
+	if lobbies then
+		local model = lobbies:FindFirstChild("_GATE" .. gateIndex)
+		local ch = readStringValue(model, "Challenge")
+		if ch then return ch:lower() end
+	end
+
+	return nil
+end
+
+--- Reward scale гейта
+local function getGateReward(gateIndex)
+	local gatesFolder = getGatesFolder()
+	if gatesFolder then
+		local info = gatesFolder:FindFirstChild(tostring(gateIndex))
+		local r = readNumberValue(info, "_portal_reward_scale")
+		if r > 0 then return r end
+	end
+
+	local lobbies = getLobbiesFolder()
+	if lobbies then
+		local model = lobbies:FindFirstChild("_GATE" .. gateIndex)
+		local r = readNumberValue(model, "_portal_reward_scale")
+		if r > 0 then return r end
+	end
+
+	return 0
+end
+
+--- Гейт заблокирован?
+local function isGateLocked(gateIndex)
+	local lobbies = getLobbiesFolder()
+	if lobbies then
+		local model = lobbies:FindFirstChild("_GATE" .. gateIndex)
+		if model and readBoolValue(model, "Locked") then
+			return true
+		end
+	end
+	return false
+end
+
+-----------------------------------------------------------------------
+-- PICK BEST GATE (used in BOTH lobby and stage for auto-next)
+-- Фильтрует locked + CHALLENGE_BLACKLIST, сортирует по reward
+-----------------------------------------------------------------------
+local function pickBestGate()
+	local best, bestReward = nil, -1
+
+	for i = 1, MAX_GATE do
+		local locked = isGateLocked(i)
+		local challenge = getGateChallenge(i)
+		local reward = getGateReward(i)
+		local blacklisted = challenge ~= nil and CHALLENGE_BLACKLIST[challenge] or false
+
+		if DEBUG then
+			warn(string.format(
+				"[HM]   gate %d: challenge=%-20s reward=%-6s locked=%-5s blacklisted=%s",
+				i,
+				tostring(challenge or "—"),
+				tostring(reward),
+				tostring(locked),
+				tostring(blacklisted)
+			))
+		end
+
+		if not locked and not blacklisted then
+			if reward > bestReward then
+				bestReward = reward
+				best = i
+			end
+		end
+	end
+
+	if best then
+		if DEBUG then
+			warn(string.format("[HM] ✓ best gate: %d (reward %s)", best, tostring(bestReward)))
+		end
+	else
+		warn("[HM] ✗ нет подходящих гейтов (все locked или blacklisted)")
+	end
+
+	return best, bestReward
+end
+
+-----------------------------------------------------------------------
+-- LOBBY: JOIN → LOCK → START
+-----------------------------------------------------------------------
+local function lobbyJoinAndStart(gateIndex)
+	if not gateIndex then
+		warn("[HM] Нет подходящих гейтов")
+		return false
+	end
+
+	local lobbyName = "_GATE" .. gateIndex
+	warn("[HM] Joining lobby:", lobbyName)
+
+	local joined = invoke("request_join_lobby", lobbyName)
+	if not joined then
+		warn("[HM] request_join_lobby failed for", lobbyName)
+		return false
+	end
+
+	task.wait(JOIN_WAIT)
+
+	-- Lock level: берём Level из lobby model если есть
+	local lobbies = getLobbiesFolder()
+	local model = lobbies and lobbies:FindFirstChild(lobbyName)
+	local levelVal = model and readStringValue(model, "Level") or nil
+	if levelVal then
+		invoke("request_lock_level", lobbyName, levelVal, false, nil)
+		task.wait(0.3)
+	end
+
+	-- Start
+	local started = invoke("request_start_game", lobbyName)
+	if not started then
+		invoke("vote_start")
+	end
+
+	return true
+end
+
+-----------------------------------------------------------------------
+-- STAGE: AUTO-NEXT AFTER game_finished (WITH BLACKLIST)
+-----------------------------------------------------------------------
+local _gameFinishedConn = nil
+
+local function setupAutoNext()
+	if _gameFinishedConn then
+		pcall(function() _gameFinishedConn:Disconnect() end)
+		_gameFinishedConn = nil
+	end
+
+	local ep = RS:FindFirstChild("endpoints")
+	local s2c = ep and ep:FindFirstChild("server_to_client")
+	local gfRemote = s2c and s2c:FindFirstChild("game_finished")
+
+	if not gfRemote then
+		warn("[HM] game_finished remote не найден")
+		return
+	end
+
+	_gameFinishedConn = gfRemote.OnClientEvent:Connect(function(...)
+		if not getgenv()._HM_Running then return end
+		if not LOOP then
+			warn("[HM] game_finished! LOOP=false, стоп.")
+			return
+		end
+
+		warn("[HM] game_finished! Ждём", GATE_DELAY, "сек...")
+		task.wait(GATE_DELAY)
+		if not getgenv()._HM_Running then return end
+
+		-- Выбираем лучший гейт С УЧЁТОМ БЛЕКЛИСТА
+		local nextGate
+		if FORCE_GATE then
+			nextGate = FORCE_GATE
+		else
+			warn("[HM] Scanning gates for auto-next...")
+			nextGate = pickBestGate()
+		end
+
+		if not nextGate then
+			warn("[HM] Нет подходящих гейтов → replay текущего")
+			invoke("set_game_finished_vote", "replay")
+			return
+		end
+
+		warn("[HM] Auto-next → gate", nextGate)
+		invoke("set_game_finished_vote", "play_gate_next", {
+			["GateUuid"] = nextGate
+		})
+	end)
+
+	warn("[HM] ✓ auto-next listener ON (game_finished)")
+end
+
+-----------------------------------------------------------------------
+-- MAIN
+-----------------------------------------------------------------------
+local function main()
+	warn("============================================")
+	warn("[HM] Hunter Mayhem Auto-Gate")
+	warn("[HM] lobby:", isLobby(), "| stage:", isStage())
+	warn("[HM] PlaceId:", game.PlaceId)
+	warn("[HM] blacklist:", (function()
+		local t = {}
+		for k in pairs(CHALLENGE_BLACKLIST) do table.insert(t, k) end
+		return #t > 0 and table.concat(t, ", ") or "(none)"
+	end)())
+	warn("============================================")
+
+	if isLobby() then
+		warn("[HM] === LOBBY MODE ===")
+		warn("[HM] Scanning gates...")
+		local gate = FORCE_GATE or pickBestGate()
+		lobbyJoinAndStart(gate)
+
+		-- После телепорта на стадию скрипт умрёт (новый PlaceId).
+		-- Настрой auto-execute в MacSploit чтобы скрипт
+		-- запускался заново на стадии.
+
+	elseif isStage() then
+		warn("[HM] === STAGE MODE ===")
+		setupAutoNext()
+
+	else
+		warn("[HM] Неизвестный контекст. PlaceId:", game.PlaceId)
+		warn("[HM] Пробую оба режима...")
+		-- На всякий случай пробуем stage listener
+		setupAutoNext()
+	end
+end
+
+main()
+
+--[[
+  ИСПОЛЬЗОВАНИЕ:
+
+  1. Запусти в лобби → скрипт выберет лучший гейт (не locked, не blacklisted,
+     макс reward) и запустит матч.
+
+  2. Запусти на стадии → скрипт повесит listener на game_finished.
+     После завершения матча выбирает следующий лучший гейт
+     С УЧЁТОМ CHALLENGE_BLACKLIST и перейдёт к нему через
+     set_game_finished_vote("play_gate_next", { GateUuid = N }).
+
+  3. Для полного автоцикла: настрой auto-execute в MacSploit,
+     чтобы скрипт запускался при каждом телепорте.
+
+  СТОП: getgenv()._HM_Stop()  или  getgenv()._HM_Running = false
+
+  НАСТРОЙКИ:
+  - CHALLENGE_BLACKLIST — какие челленджи пропускать
+    triple_cost / double_cost / short_range / godspeed_enemies /
+    shield_enemies / flying_enemies / regen_enemies / tank_enemies / fast_enemies
+  - FORCE_GATE = N — всегда идти в конкретный гейт (игнорирует автовыбор)
+  - LOOP = false — один раз и стоп
+  - DEBUG = false — тихий режим
+]]
   Сценарий: лучший непройденный гейт → request_join_lobby → Normal → Start.
   Со стадии можно цеплять следующий гейт без возврата в лобби-плейс — те же ремоуты.
 
