@@ -1,3 +1,6 @@
+if not game:IsLoaded() then
+    game.Loaded:Wait()
+end
 --[[
   Hunter Mayhem — Anime Crusaders
   Auto Gate: pick best gate → join → start → wait finish → next gate → repeat
