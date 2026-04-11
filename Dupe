@@ -1,3 +1,4 @@
+task.wait(4)
 -- Auto Trait Reroller — Anime Overload
 local Players = game:GetService("Players")
 local RS = game:GetService("ReplicatedStorage")
@@ -156,6 +157,14 @@ local _TR = {
 	SummonsPerSession = savedState.SummonsPerSession or 5,
 	TargetFound = false,
 	StopAfterReload = savedState.StopAfterReload or false,
+
+	-- Webhook
+	WebhookURL = savedState.WebhookURL or "",
+	WebhookEnabled = savedState.WebhookEnabled or false,
+	SessionPulls = {},       -- { [prettyName] = count } for current banner session
+	SessionPullOrder = {},   -- ordered list of unique names (first-seen order)
+	SessionTraits = {},      -- { [traitLabel] = count } for current reroll session
+	SessionTraitOrder = {},  -- ordered list of unique trait labels
 }
 
 local function SaveAll()
@@ -169,6 +178,8 @@ local function SaveAll()
 		TotalSummons = _TR.TotalSummons,
 		SummonsPerSession = _TR.SummonsPerSession,
 		StopAfterReload = _TR.StopAfterReload,
+		WebhookURL = _TR.WebhookURL,
+		WebhookEnabled = _TR.WebhookEnabled,
 	})
 end
 
@@ -177,6 +188,7 @@ end
 ---------------------------------------------------------------------------
 local _rejoining = false
 local _bugArmed = false
+local rejoin -- forward declaration; defined below
 
 local function armBugRefund()
 	if _bugArmed then return end
@@ -199,6 +211,176 @@ local function disarmBugRefund()
 		playerNet.updateSettings.fire("uiVolume", 0.5)
 	end)
 	_bugArmed = false
+end
+
+---------------------------------------------------------------------------
+-- Webhook (progress report before rejoin)
+---------------------------------------------------------------------------
+local _cachedRequest = (syn and syn.request)
+	or (http and http.request)
+	or http_request
+	or request
+	or (fluxus and fluxus.request)
+	or nil
+
+local function resetSessionPulls()
+	_TR.SessionPulls = {}
+	_TR.SessionPullOrder = {}
+end
+
+local function recordSessionPull(name)
+	if not name then return end
+	if _TR.SessionPulls[name] == nil then
+		_TR.SessionPullOrder[#_TR.SessionPullOrder + 1] = name
+		_TR.SessionPulls[name] = 1
+	else
+		_TR.SessionPulls[name] = _TR.SessionPulls[name] + 1
+	end
+end
+
+local function buildSessionPullReport()
+	if #_TR.SessionPullOrder == 0 then return "—" end
+	local lines = {}
+	for _, name in ipairs(_TR.SessionPullOrder) do
+		local n = _TR.SessionPulls[name] or 1
+		if n > 1 then
+			lines[#lines + 1] = ("• %s x%d"):format(name, n)
+		else
+			lines[#lines + 1] = ("• %s"):format(name)
+		end
+	end
+	return table.concat(lines, "\n")
+end
+
+local function buildTargetNameList()
+	if not next(_TR.TargetHeroIds) then return "—" end
+	local parts = {}
+	for id, sel in pairs(_TR.TargetHeroIds) do
+		if sel then parts[#parts + 1] = heroName(id) end
+	end
+	table.sort(parts)
+	return table.concat(parts, ", ")
+end
+
+local function resetSessionTraits()
+	_TR.SessionTraits = {}
+	_TR.SessionTraitOrder = {}
+end
+
+local function recordSessionTrait(label)
+	if not label then return end
+	if _TR.SessionTraits[label] == nil then
+		_TR.SessionTraitOrder[#_TR.SessionTraitOrder + 1] = label
+		_TR.SessionTraits[label] = 1
+	else
+		_TR.SessionTraits[label] = _TR.SessionTraits[label] + 1
+	end
+end
+
+local function buildSessionTraitReport()
+	if #_TR.SessionTraitOrder == 0 then return "—" end
+	local lines = {}
+	for _, name in ipairs(_TR.SessionTraitOrder) do
+		local n = _TR.SessionTraits[name] or 1
+		if n > 1 then
+			lines[#lines + 1] = ("• %s x%d"):format(name, n)
+		else
+			lines[#lines + 1] = ("• %s"):format(name)
+		end
+	end
+	return table.concat(lines, "\n")
+end
+
+local function buildTargetTraitList()
+	if not next(_TR.TargetTraits) then return "—" end
+	local parts = {}
+	for id, sel in pairs(_TR.TargetTraits) do
+		if sel then parts[#parts + 1] = traitIdToName[id] or id end
+	end
+	table.sort(parts)
+	return table.concat(parts, ", ")
+end
+
+local function getSelectedHeroLabel()
+	if not _TR.SelectedHeroId then return "—" end
+	return heroName(_TR.SelectedHeroId)
+end
+
+-- mode: "summon" | "trait"
+-- kind: "clean" (target found, saving) | "bug" (NaN refund rejoin) | "manual"
+local function sendRejoinWebhook(mode, kind)
+	if not _TR.WebhookEnabled then return end
+	local url = _TR.WebhookURL
+	if not url or url == "" then return end
+
+	local title, color
+	if kind == "clean" then
+		title = "✅ Цель поймана — чистый реджоин"
+		color = 4437377 -- green
+	elseif kind == "manual" then
+		title = "⏹ Ручное выключение — возврат гемов"
+		color = 10197915 -- gray
+	else
+		title = "🔁 Сессия завершена — реджоин с возвратом"
+		color = 15277667 -- purple/red
+	end
+
+	local desc
+	if mode == "trait" then
+		desc = ("**Режим:** Trait Reroll\n**Герой:** %s\n**Целевые трейты:** %s\n**Всего реролов всего:** %d\n\n**Что выпало:**\n%s"):format(
+			getSelectedHeroLabel(),
+			buildTargetTraitList(),
+			_TR.TotalRerolls or 0,
+			buildSessionTraitReport()
+		)
+	else
+		desc = ("**Режим:** Banner Summon\n**Кого крутили:** %s\n**Баннер:** %s x%d\n**Всего круток всего:** %d\n\n**Что выпало:**\n%s"):format(
+			buildTargetNameList(),
+			tostring(_TR.SummonBanner or "?"),
+			_TR.SummonAmount or 1,
+			_TR.TotalSummons or 0,
+			buildSessionPullReport()
+		)
+	end
+
+	task.spawn(function()
+		local payload = HttpService:JSONEncode({
+			username = "Apel Hub • Trait Reroller",
+			embeds = {{
+				title = title,
+				description = desc,
+				color = color,
+				footer = { text = "Apel Hub • " .. os.date("%Y-%m-%d %H:%M:%S") },
+			}},
+		})
+
+		local sent = false
+		if _cachedRequest then
+			local ok = pcall(function()
+				_cachedRequest({
+					Url = url, Method = "POST",
+					Headers = { ["Content-Type"] = "application/json" },
+					Body = payload,
+				})
+			end)
+			if ok then sent = true end
+		end
+		if not sent then
+			local ok = pcall(function()
+				HttpService:RequestAsync({
+					Url = url, Method = "POST",
+					Headers = { ["Content-Type"] = "application/json" },
+					Body = payload,
+				})
+			end)
+			if ok then sent = true end
+		end
+		if not sent then
+			pcall(function()
+				HttpService:PostAsync(url, payload, Enum.HttpContentType.ApplicationJson, false)
+			end)
+		end
+	end)
 end
 
 -- Restore hero by heroId
@@ -366,6 +548,25 @@ SLeft:Slider({
 
 local SummonStatsLabel = SLeft:Label({ Text = "Total summons: " .. _TR.TotalSummons })
 
+SLeft:Input({
+	Name = "Discord Webhook URL",
+	Placeholder = "https://discord.com/api/webhooks/...",
+	Default = _TR.WebhookURL or "",
+	Numeric = false,
+	Finished = true,
+	Callback = function(val)
+		_TR.WebhookURL = tostring(val or "")
+	end,
+}, "WebhookURLInput")
+
+SLeft:Toggle({
+	Name = "Enable Webhook Reports",
+	Default = _TR.WebhookEnabled or false,
+	Callback = function(val)
+		_TR.WebhookEnabled = val
+	end,
+}, "WebhookEnabledToggle")
+
 SLeft:Toggle({
 	Name = "Auto Banner Summon",
 	Default = false,
@@ -375,9 +576,15 @@ SLeft:Toggle({
 			_TR.TargetFound = false
 			_bugArmed = false -- ensure next session arms fresh
 		else
-			-- Manual disable: if we already armed the bug this session, undo it
+			-- Manual disable while bug was armed → bug rejoin to refund spent gems,
+			-- then keep the toggle off after the reload.
 			if _bugArmed and not _rejoining then
-				disarmBugRefund()
+				print("[TR] Manual disable — refunding via bug rejoin")
+				task.spawn(function()
+					_TR.StopAfterReload = true
+					sendRejoinWebhook("summon", "manual")
+					rejoin()
+				end)
 			end
 		end
 	end,
@@ -433,6 +640,14 @@ task.spawn(function()
 		local opt = MacLib.Options["AutoBannerSummonToggle"]
 		if opt and opt.Value ~= nil then _TR.BannerSummonEnabled = opt.Value end
 	end)
+	pcall(function()
+		local opt = MacLib.Options["WebhookURLInput"]
+		if opt and opt.Value then _TR.WebhookURL = tostring(opt.Value) end
+	end)
+	pcall(function()
+		local opt = MacLib.Options["WebhookEnabledToggle"]
+		if opt and opt.Value ~= nil then _TR.WebhookEnabled = opt.Value end
+	end)
 
 	-- If we just rejoined cleanly after hitting a target — disable both toggles
 	if savedState.StopAfterReload then
@@ -469,7 +684,7 @@ end)
 ---------------------------------------------------------------------------
 -- Rejoin
 ---------------------------------------------------------------------------
-local function rejoin()
+function rejoin()
 	if _rejoining then return end
 	_rejoining = true
 	print("[TR] >>> REJOIN (NaN bug, double-shot) <<<")
@@ -516,13 +731,14 @@ if summonNet and summonNet.summonHero and summonNet.summonHero.call then
 	summonNet.summonHero.call = function(amount, bannerKey)
 		local ok, res = _origSummonCall(amount, bannerKey)
 		if ok and type(res) == "table" then
-			-- Print every hero from the pull
+			-- Print every hero from the pull + record into session rollup
 			local names = {}
 			for _, h in ipairs(res) do
 				if type(h) == "table" and h.id then
 					local nm = heroName(h.id)
 					if h.shiny then nm = nm .. "★" end
 					names[#names + 1] = nm
+					recordSessionPull(nm)
 				end
 			end
 			if #names > 0 then
@@ -556,7 +772,7 @@ end
 ---------------------------------------------------------------------------
 -- Banner Summon loop
 ---------------------------------------------------------------------------
-local SUMMON_DELAY = 0.05 -- delay between summons
+local SUMMON_DELAY = 0.225 -- delay between summons
 
 task.spawn(function()
 	task.wait(0.5)
@@ -566,6 +782,9 @@ task.spawn(function()
 		if not next(_TR.TargetHeroIds) then
 			warn("[TR] No target heroes selected!") _TR.BannerSummonEnabled = false continue
 		end
+
+		-- Fresh session: clear the pull rollup so the webhook shows only this run
+		resetSessionPulls()
 
 		-- ARM bug refund BEFORE any summons. If something kills the script mid-session,
 		-- the NaN packet is already on the server and the next rejoin will refund.
@@ -607,6 +826,7 @@ task.spawn(function()
 
 		-- Target pulled → CLEAN rejoin so the unit is saved
 		if _TR.TargetFound then
+			sendRejoinWebhook("summon", "clean")
 			cleanRejoin()
 			return
 		end
@@ -619,6 +839,7 @@ task.spawn(function()
 
 		-- Limit reached, no target → BUG rejoin (NaN) to refund gems
 		print(string.format("[TR] Session done (%d calls) — bug rejoin", sessionCalls))
+		sendRejoinWebhook("summon", "bug")
 		rejoin()
 		return
 	end
@@ -642,6 +863,9 @@ task.spawn(function()
 
 		local uuid = _TR.SelectedHeroUUID
 
+		-- Fresh session: clear the trait rollup so the webhook shows only this run
+		resetSessionTraits()
+
 		for i = 1, _TR.RerollsPerSession do
 			if not _TR.Enabled or not getgenv()._TRRunning then break end
 
@@ -656,6 +880,7 @@ task.spawn(function()
 					local got = result.trait
 					local gotName = traitIdToName[got] or got
 					print("[TR] Got:", gotName)
+					recordSessionTrait(gotName)
 
 					if _TR.TargetTraits[got] then
 						print("[TR] ★★★ TARGET TRAIT FOUND:", gotName, "★★★ after", _TR.TotalRerolls, "rerolls")
@@ -666,6 +891,7 @@ task.spawn(function()
 								Lifetime = 30,
 							})
 						end)
+						sendRejoinWebhook("trait", "clean")
 						cleanRejoin()
 						return
 					end
@@ -686,6 +912,7 @@ task.spawn(function()
 		end
 
 		if _TR.Enabled and getgenv()._TRRunning then
+			sendRejoinWebhook("trait", "bug")
 			rejoin()
 			return
 		end
