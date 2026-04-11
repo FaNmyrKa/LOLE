@@ -1,4 +1,4 @@
--- Auto Trait Reroller + Banner Summon — Anime Overload
+-- Auto Trait Reroller — Anime Overload
 local Players = game:GetService("Players")
 local RS = game:GetService("ReplicatedStorage")
 local TeleportService = game:GetService("TeleportService")
@@ -13,7 +13,7 @@ if getgenv()._TRUI then pcall(function() getgenv()._TRUI:Unload() end) end
 getgenv()._TRRunning = true
 
 ---------------------------------------------------------------------------
--- Runtime state
+-- Runtime state (survives rejoin, non-UI data)
 ---------------------------------------------------------------------------
 if not isfolder("ApelHub") then makefolder("ApelHub") end
 local STATE_FILE = "ApelHub/TraitRerollerState.json"
@@ -36,8 +36,6 @@ if not lc then warn("[TR] Not in lobby!") getgenv()._TRRunning = false return en
 local heroesNet = require(lc:WaitForChild("net"):WaitForChild("heroes"))
 local reflexNet = require(lc:WaitForChild("net"):WaitForChild("reflex"))
 local clientStore = require(lc:WaitForChild("store"):WaitForChild("clientStore"))
-local playerNet = nil
-pcall(function() playerNet = require(lc:WaitForChild("net"):WaitForChild("player")) end)
 local summonNet = nil
 pcall(function() summonNet = require(lc:WaitForChild("net"):WaitForChild("summon")) end)
 
@@ -67,25 +65,11 @@ local TRAITS = {
 }
 
 local traitNameToId, traitIdToName, traitNames = {}, {}, {}
-local traitDisplayToId = {}
-local traitLowerToId = {}
 for _, t in ipairs(TRAITS) do
 	local label = t.name .. " (" .. t.rarity .. ")"
 	traitNameToId[label] = t.id
 	traitIdToName[t.id] = label
-	traitDisplayToId[t.name] = t.id
-	traitLowerToId[t.id:lower()] = t.id
-	traitLowerToId[t.name:lower()] = t.id
 	traitNames[#traitNames + 1] = label
-end
-
-local function normalizeTraitId(raw)
-	if not raw then return nil end
-	if traitIdToName[raw] then return raw end
-	if traitDisplayToId[raw] then return traitDisplayToId[raw] end
-	local lower = raw:lower()
-	if traitLowerToId[lower] then return traitLowerToId[lower] end
-	return raw
 end
 
 local itemsCfg = nil
@@ -99,27 +83,25 @@ local function heroName(heroId)
 	return tostring(heroId)
 end
 
-local function buildSummonHeroList()
+-- Build list of all Secret heroes from heroRarities config
+local function buildSecretHeroList()
 	local list = {}
 	pcall(function()
 		local hr = require(RS:WaitForChild("shared"):WaitForChild("config"):WaitForChild("summon"):WaitForChild("heroRarities"))
-		if hr then
-			for rarity, heroes in pairs(hr) do
-				if type(heroes) == "table" then
-					for id, _ in pairs(heroes) do
-						list[#list + 1] = { id = id, name = heroName(id) .. " (" .. tostring(rarity) .. ")" }
-					end
-				end
+		if hr and hr.Secret then
+			for id, _ in pairs(hr.Secret) do
+				list[#list + 1] = { id = id, name = heroName(id) }
 			end
 		end
 	end)
+	-- Fallback: scan itemsCfg for any Secret-rarity hero
 	if #list == 0 and itemsCfg then
 		pcall(function()
 			local all = itemsCfg.hero.getAll and itemsCfg.hero.getAll() or nil
 			if type(all) == "table" then
 				for id, cfg in pairs(all) do
-					if type(cfg) == "table" then
-						list[#list + 1] = { id = id, name = (cfg.name or tostring(id)) .. " (" .. (cfg.rarity or "?") .. ")" }
+					if type(cfg) == "table" and cfg.rarity == "Secret" then
+						list[#list + 1] = { id = id, name = cfg.name or tostring(id) }
 					end
 				end
 			end
@@ -141,7 +123,7 @@ local function buildHeroList()
 	for uuid, hero in pairs(bag) do
 		if type(hero) == "table" and hero.id then
 			local name = heroName(hero.id)
-			local trait = hero.trait and (traitIdToName[normalizeTraitId(hero.trait)] or hero.trait) or "None"
+			local trait = hero.trait and (traitIdToName[hero.trait] or hero.trait) or "None"
 			local shiny = hero.shiny and " ★" or ""
 			list[#list + 1] = {
 				uuid = uuid, heroId = hero.id,
@@ -157,10 +139,6 @@ end
 ---------------------------------------------------------------------------
 -- State
 ---------------------------------------------------------------------------
-local GEMS_PER_SESSION = 3000
-local REROLL_DELAY = 0.25
-local SUMMON_DELAY = 0.05
-
 local _TR = {
 	Enabled = false,
 	SelectedHeroUUID = nil,
@@ -175,8 +153,8 @@ local _TR = {
 	SummonBanner = savedState.SummonBanner or "NORMAL",
 	SummonAmount = savedState.SummonAmount or 10,
 	TotalSummons = savedState.TotalSummons or 0,
+	SummonsPerSession = savedState.SummonsPerSession or 5,
 	TargetFound = false,
-	GemsSpentThisSession = 0,
 	StopAfterReload = savedState.StopAfterReload or false,
 }
 
@@ -189,8 +167,38 @@ local function SaveAll()
 		SummonBanner = _TR.SummonBanner,
 		SummonAmount = _TR.SummonAmount,
 		TotalSummons = _TR.TotalSummons,
+		SummonsPerSession = _TR.SummonsPerSession,
 		StopAfterReload = _TR.StopAfterReload,
 	})
+end
+
+---------------------------------------------------------------------------
+-- Bug arm/disarm helpers (declared early so toggle callback can use them)
+---------------------------------------------------------------------------
+local _rejoining = false
+local _bugArmed = false
+
+local function armBugRefund()
+	if _bugArmed then return end
+	print("[TR] [BUG] Arming NaN refund (uiVolume = 0/0)")
+	local ok = pcall(function()
+		local playerNet = require(game:GetService("ReplicatedStorage").lobbyClient.net.player)
+		playerNet.updateSettings.fire("uiVolume", 0/0)
+	end)
+	if ok then
+		_bugArmed = true
+	else
+		warn("[TR] [BUG] Arm failed")
+	end
+end
+
+local function disarmBugRefund()
+	print("[TR] [BUG] Disarming refund (uiVolume = 0.5)")
+	pcall(function()
+		local playerNet = require(game:GetService("ReplicatedStorage").lobbyClient.net.player)
+		playerNet.updateSettings.fire("uiVolume", 0.5)
+	end)
+	_bugArmed = false
 end
 
 -- Restore hero by heroId
@@ -278,12 +286,14 @@ SLeft:Dropdown({
 SRight:Slider({
 	Name = "Rerolls per session",
 	Minimum = 1,
-	Maximum = 5,
+	Maximum = 10,
 	Default = 5,
 	Callback = function(val)
 		_TR.RerollsPerSession = math.floor(val)
 	end,
 }, "RerollsSlider")
+
+local REROLL_DELAY = 0.25
 
 local StatsLabel = SRight:Label({ Text = "Total rerolls: " .. _TR.TotalRerolls })
 
@@ -300,25 +310,26 @@ SRight:Toggle({
 ---------------------------------------------------------------------------
 SLeft:Header({ Text = "Banner Summon" })
 
-local summonHeroes = buildSummonHeroList()
-local summonLabels, summonLabelToId = {}, {}
-for _, h in ipairs(summonHeroes) do
-	summonLabels[#summonLabels + 1] = h.name
-	summonLabelToId[h.name] = h.id
+-- Secret hero list
+local secretHeroes = buildSecretHeroList()
+local secretLabels, secretLabelToId = {}, {}
+for _, h in ipairs(secretHeroes) do
+	secretLabels[#secretLabels + 1] = h.name
+	secretLabelToId[h.name] = h.id
 end
-if #summonLabels == 0 then summonLabels[1] = "No heroes found" end
+if #secretLabels == 0 then secretLabels[1] = "No secret heroes found" end
 
 SLeft:Dropdown({
-	Name = "Target Heroes",
-	Options = summonLabels,
+	Name = "Target Secret Heroes",
+	Options = secretLabels,
 	Multi = true,
 	Search = true,
 	Callback = function(val)
 		_TR.TargetHeroIds = {}
 		if type(val) == "table" then
 			for label, selected in pairs(val) do
-				if selected and summonLabelToId[label] then
-					_TR.TargetHeroIds[summonLabelToId[label]] = true
+				if selected and secretLabelToId[label] then
+					_TR.TargetHeroIds[secretLabelToId[label]] = true
 				end
 			end
 		end
@@ -343,6 +354,16 @@ SLeft:Dropdown({
 	end,
 }, "SummonAmountDropdown")
 
+SLeft:Slider({
+	Name = "Summons before rejoin",
+	Minimum = 1,
+	Maximum = 15,
+	Default = _TR.SummonsPerSession,
+	Callback = function(val)
+		_TR.SummonsPerSession = math.floor(val)
+	end,
+}, "SummonsPerSessionSlider")
+
 local SummonStatsLabel = SLeft:Label({ Text = "Total summons: " .. _TR.TotalSummons })
 
 SLeft:Toggle({
@@ -350,9 +371,19 @@ SLeft:Toggle({
 	Default = false,
 	Callback = function(val)
 		_TR.BannerSummonEnabled = val
-		if val then _TR.TargetFound = false _TR.GemsSpentThisSession = 0 end
+		if val then
+			_TR.TargetFound = false
+			_bugArmed = false -- ensure next session arms fresh
+		else
+			-- Manual disable: if we already armed the bug this session, undo it
+			if _bugArmed and not _rejoining then
+				disarmBugRefund()
+			end
+		end
 	end,
 }, "AutoBannerSummonToggle")
+
+-- Config section не нужна — MacLib авто-сохраняет
 
 ---------------------------------------------------------------------------
 -- MacLib config
@@ -367,6 +398,7 @@ MacLib:LoadAutoLoadConfig()
 task.spawn(function()
 	task.wait(0.3)
 
+	-- Sync loaded config → state
 	pcall(function()
 		local opt = MacLib.Options["HeroDropdown"]
 		if opt and opt.Value then
@@ -374,6 +406,8 @@ task.spawn(function()
 			_TR.SelectedHeroId = heroLabelToId[opt.Value]
 		end
 	end)
+	-- TargetTraits уже загружены из savedState — не перезаписываем
+	-- MacLib показывает визуально, но source of truth = файл
 	pcall(function()
 		local opt = MacLib.Options["RerollsSlider"]
 		if opt and opt.Value then _TR.RerollsPerSession = math.floor(opt.Value) end
@@ -382,6 +416,7 @@ task.spawn(function()
 		local opt = MacLib.Options["AutoRerollToggle"]
 		if opt and opt.Value ~= nil then _TR.Enabled = opt.Value end
 	end)
+	-- TargetHeroIds уже загружены из savedState — не перезаписываем
 	pcall(function()
 		local opt = MacLib.Options["BannerDropdown"]
 		if opt and opt.Value then _TR.SummonBanner = opt.Value end
@@ -391,21 +426,32 @@ task.spawn(function()
 		if opt and opt.Value then _TR.SummonAmount = opt.Value == "x10" and 10 or 1 end
 	end)
 	pcall(function()
+		local opt = MacLib.Options["SummonsPerSessionSlider"]
+		if opt and opt.Value then _TR.SummonsPerSession = math.floor(opt.Value) end
+	end)
+	pcall(function()
 		local opt = MacLib.Options["AutoBannerSummonToggle"]
 		if opt and opt.Value ~= nil then _TR.BannerSummonEnabled = opt.Value end
 	end)
 
-	-- StopAfterReload: target was saved last session → stop everything
+	-- If we just rejoined cleanly after hitting a target — disable both toggles
 	if savedState.StopAfterReload then
-		print("[TR] Clean rejoin completed — target saved. Stopping.")
+		print("[TR] Clean rejoin completed — target was saved. Stopping all autos.")
 		_TR.BannerSummonEnabled = false
 		_TR.Enabled = false
 		_TR.StopAfterReload = false
-		pcall(function() MacLib.Options["AutoBannerSummonToggle"]:UpdateState(false) end)
-		pcall(function() MacLib.Options["AutoRerollToggle"]:UpdateState(false) end)
+		pcall(function()
+			local opt = MacLib.Options["AutoBannerSummonToggle"]
+			if opt and opt.SetValue then opt:SetValue(false) end
+		end)
+		pcall(function()
+			local opt = MacLib.Options["AutoRerollToggle"]
+			if opt and opt.SetValue then opt:SetValue(false) end
+		end)
 		SaveAll()
 	end
 
+	-- Fallback: restore hero by savedState heroId
 	if not _TR.SelectedHeroUUID and savedState.SelectedHeroId then
 		for uuid, hero in pairs(getHeroBag()) do
 			if hero.id == savedState.SelectedHeroId then
@@ -421,52 +467,34 @@ task.spawn(function()
 end)
 
 ---------------------------------------------------------------------------
--- Helpers
+-- Rejoin
 ---------------------------------------------------------------------------
-local function stopReroll()
-	_TR.Enabled = false
-	task.defer(function()
-		pcall(function() MacLib.Options["AutoRerollToggle"]:UpdateState(false) end)
-	end)
-end
-
-local function stopBannerSummon()
-	_TR.BannerSummonEnabled = false
-	task.defer(function()
-		pcall(function() MacLib.Options["AutoBannerSummonToggle"]:UpdateState(false) end)
-	end)
-end
-
----------------------------------------------------------------------------
--- Rejoin: dirty (rollback) vs clean (save)
----------------------------------------------------------------------------
-local _rejoining = false
-
--- Dirty rejoin — сервер НЕ сохранит, гемы/тикеты откатятся
 local function rejoin()
 	if _rejoining then return end
 	_rejoining = true
-	print("[TR] >>> REJOIN (rollback) <<<")
+	print("[TR] >>> REJOIN (NaN bug, double-shot) <<<")
 	SaveAll()
-	task.wait(0.3)
+	-- Second NaN shot for guaranteed delivery (first one was at session start)
+	_bugArmed = false -- force armBugRefund to fire again
+	armBugRefund()
+	-- Let the NaN packet actually leave the client before teleporting
+	task.wait(0.5)
 	TeleportService:TeleportToPlaceInstance(game.PlaceId, game.JobId, LP)
 end
 
--- Clean rejoin — отправляет валидный запрос чтобы сервер СОХРАНИЛ профиль
+-- Clean rejoin: sends a VALID uiVolume (0.5) before teleporting, so the server saves
+-- the new hero/trait. Overrides any previously armed NaN bug.
 local function cleanRejoin()
 	if _rejoining then return end
 	_rejoining = true
-	print("[TR] >>> CLEAN REJOIN (saving target) <<<")
+	print("[TR] >>> CLEAN REJOIN (target found, saving) <<<")
 	_TR.StopAfterReload = true
-	stopReroll()
-	stopBannerSummon()
+	_TR.BannerSummonEnabled = false
+	_TR.Enabled = false
 	SaveAll()
-	-- Триггерим серверный сейв
-	pcall(function()
-		if playerNet and playerNet.updateSettings and playerNet.updateSettings.fire then
-			playerNet.updateSettings.fire("uiVolume", 0.5)
-		end
-	end)
+	-- Disarm: send valid 0.5 to override the prior NaN
+	disarmBugRefund()
+	-- Let the valid packet flush + give server time to persist
 	task.wait(0.5)
 	TeleportService:TeleportToPlaceInstance(game.PlaceId, game.JobId, LP)
 end
@@ -488,6 +516,7 @@ if summonNet and summonNet.summonHero and summonNet.summonHero.call then
 	summonNet.summonHero.call = function(amount, bannerKey)
 		local ok, res = _origSummonCall(amount, bannerKey)
 		if ok and type(res) == "table" then
+			-- Print every hero from the pull
 			local names = {}
 			for _, h in ipairs(res) do
 				if type(h) == "table" and h.id then
@@ -500,11 +529,12 @@ if summonNet and summonNet.summonHero and summonNet.summonHero.call then
 				print("[TR] Pulled [" .. tostring(bannerKey) .. " x" .. tostring(amount) .. "]: " .. table.concat(names, ", "))
 			end
 
+			-- Target detection
 			if next(_TR.TargetHeroIds) then
 				for _, h in ipairs(res) do
 					if type(h) == "table" and h.id and _TR.TargetHeroIds[h.id] then
 						_TR.TargetFound = true
-						stopBannerSummon()
+						_TR.BannerSummonEnabled = false
 						print("[TR] ★★★ TARGET HERO PULLED: " .. heroName(h.id) .. " ★★★ after " .. _TR.TotalSummons .. " summons")
 						pcall(function()
 							Window:Notify({
@@ -526,67 +556,76 @@ end
 ---------------------------------------------------------------------------
 -- Banner Summon loop
 ---------------------------------------------------------------------------
+local SUMMON_DELAY = 0.05 -- delay between summons
+
 task.spawn(function()
 	task.wait(0.5)
 	while getgenv()._TRRunning do
 		if not _TR.BannerSummonEnabled or not summonNet then task.wait(0.2) continue end
 
 		if not next(_TR.TargetHeroIds) then
-			warn("[TR] No target heroes selected!")
-			stopBannerSummon()
-			continue
+			warn("[TR] No target heroes selected!") _TR.BannerSummonEnabled = false continue
 		end
+
+		-- ARM bug refund BEFORE any summons. If something kills the script mid-session,
+		-- the NaN packet is already on the server and the next rejoin will refund.
+		armBugRefund()
 
 		local banner = _TR.SummonBanner or "NORMAL"
 		local amount = _TR.SummonAmount or 10
 		local cost = (banner == "CRIMSON" and 60 or 50) * amount
-		local cur = GetSummonCurrency(banner)
+		local limit = _TR.SummonsPerSession or 5
 
-		-- Лимит гемов за сессию
-		if _TR.GemsSpentThisSession >= GEMS_PER_SESSION then
-			if _TR.TargetFound then
-				cleanRejoin()
-			else
-				print(string.format("[TR] Gem limit reached (%d/%d) — rollback rejoin (total: %d)", _TR.GemsSpentThisSession, GEMS_PER_SESSION, _TR.TotalSummons))
-				rejoin()
+		-- Run a fixed number of summon CALLS (x1 and x10 both count as 1 call)
+		local sessionCalls = 0
+		for i = 1, limit do
+			if not _TR.BannerSummonEnabled or not getgenv()._TRRunning then break end
+			if _TR.TargetFound then break end
+
+			local cur = GetSummonCurrency(banner)
+			if cur < cost then
+				print(string.format("[TR] Out of gems early at call %d/%d (%d/%d)", i, limit, cur, cost))
+				break
 			end
-			return
-		end
 
-		-- Не хватает гемов
-		if cur < cost then
-			if _TR.TargetFound then
-				cleanRejoin()
+			print(string.format("[TR] Call %d/%d | x%d [%s] | gems: %d → %d", i, limit, amount, banner, cur, cur - cost))
+			local ok, err = pcall(function() summonNet.summonHero.call(amount, banner) end)
+			if ok then
+				_TR.TotalSummons = _TR.TotalSummons + amount
+				sessionCalls = sessionCalls + 1
+				pcall(function() SummonStatsLabel:UpdateName("Total summons: " .. _TR.TotalSummons) end)
 			else
-				print(string.format("[TR] Out of gems (%d/%d) — rollback rejoin (total: %d)", cur, cost, _TR.TotalSummons))
-				rejoin()
+				warn("[TR] Summon error:", tostring(err))
+				task.wait(0.3)
 			end
-			return
+
+			if _TR.TargetFound then break end
+			task.wait(SUMMON_DELAY)
 		end
 
-		print(string.format("[TR] Summon x%d [%s] | gems: %d → %d | session: %d/%d", amount, banner, cur, cur - cost, _TR.GemsSpentThisSession, GEMS_PER_SESSION))
-		local ok, err = pcall(function() summonNet.summonHero.call(amount, banner) end)
-		if ok then
-			_TR.TotalSummons = _TR.TotalSummons + amount
-			_TR.GemsSpentThisSession = _TR.GemsSpentThisSession + cost
-			pcall(function() SummonStatsLabel:UpdateName("Total summons: " .. _TR.TotalSummons .. " | " .. _TR.GemsSpentThisSession .. "/" .. GEMS_PER_SESSION) end)
-		else
-			warn("[TR] Summon error:", tostring(err))
-			task.wait(0.3)
-		end
+		if not getgenv()._TRRunning then return end
 
-		-- Target найден хуком → clean rejoin (сохранить героя)
+		-- Target pulled → CLEAN rejoin so the unit is saved
 		if _TR.TargetFound then
 			cleanRejoin()
 			return
 		end
 
-		task.wait(SUMMON_DELAY)
+		-- Toggle disabled mid-session → disarm and stop
+		if not _TR.BannerSummonEnabled then
+			if _bugArmed then disarmBugRefund() end
+			continue
+		end
+
+		-- Limit reached, no target → BUG rejoin (NaN) to refund gems
+		print(string.format("[TR] Session done (%d calls) — bug rejoin", sessionCalls))
+		rejoin()
+		return
 	end
 end)
 
 ---------------------------------------------------------------------------
--- Main reroll loop
+-- Main loop
 ---------------------------------------------------------------------------
 task.spawn(function()
 	task.wait(2)
@@ -595,36 +634,13 @@ task.spawn(function()
 		if not _TR.Enabled then task.wait(0.3) continue end
 
 		if not _TR.SelectedHeroUUID then
-			warn("[TR] No hero selected!") stopReroll() continue
+			warn("[TR] No hero selected!") _TR.Enabled = false continue
 		end
 		if not next(_TR.TargetTraits) then
-			warn("[TR] No target traits!") stopReroll() continue
+			warn("[TR] No target traits!") _TR.Enabled = false continue
 		end
 
 		local uuid = _TR.SelectedHeroUUID
-
-		-- Pre-roll check
-		pcall(function()
-			local bag = getHeroBag()
-			local hero = bag[uuid]
-			if hero and hero.trait then
-				local current = normalizeTraitId(hero.trait)
-				if _TR.TargetTraits[current] then
-					local currentName = traitIdToName[current] or hero.trait
-					print("[TR] ★★★ ALREADY HAS TARGET:", currentName, "★★★")
-					stopReroll()
-					SaveAll()
-					pcall(function()
-						Window:Notify({
-							Title = "Already has target!",
-							Description = currentName .. " | Total: " .. _TR.TotalRerolls,
-							Lifetime = 30,
-						})
-					end)
-				end
-			end
-		end)
-		if not _TR.Enabled then continue end
 
 		for i = 1, _TR.RerollsPerSession do
 			if not _TR.Enabled or not getgenv()._TRRunning then break end
@@ -637,13 +653,12 @@ task.spawn(function()
 
 			if ok and type(result) == "table" then
 				if result.result == "success" then
-					local raw = result.trait
-					local got = normalizeTraitId(raw)
-					local gotName = traitIdToName[got] or raw
-					print("[TR] Got:", gotName, "(raw:", tostring(raw), "→ id:", tostring(got), ")")
+					local got = result.trait
+					local gotName = traitIdToName[got] or got
+					print("[TR] Got:", gotName)
 
 					if _TR.TargetTraits[got] then
-						print("[TR] ★★★ TARGET FOUND:", gotName, "★★★ after", _TR.TotalRerolls, "rerolls")
+						print("[TR] ★★★ TARGET TRAIT FOUND:", gotName, "★★★ after", _TR.TotalRerolls, "rerolls")
 						pcall(function()
 							Window:Notify({
 								Title = "Trait Found!",
@@ -651,7 +666,6 @@ task.spawn(function()
 								Lifetime = 30,
 							})
 						end)
-						-- Clean rejoin — сохранить трейт
 						cleanRejoin()
 						return
 					end
@@ -659,7 +673,7 @@ task.spawn(function()
 					warn("[TR] Fail:", result.reason or "?")
 					if result.reason and result.reason:lower():find("ticket") then
 						print("[TR] Out of tickets!")
-						stopReroll()
+						_TR.Enabled = false
 						SaveAll()
 						break
 					end
@@ -671,7 +685,6 @@ task.spawn(function()
 			if i < _TR.RerollsPerSession then task.wait(REROLL_DELAY) end
 		end
 
-		-- Сессия закончена, target не найден → rollback rejoin (тикеты вернутся)
 		if _TR.Enabled and getgenv()._TRRunning then
 			rejoin()
 			return
@@ -681,21 +694,6 @@ end)
 
 Window.onUnloaded(function()
 	getgenv()._TRRunning = false
-	stopReroll()
-	stopBannerSummon()
+	_TR.Enabled = false
 	SaveAll()
 end)
-
----------------------------------------------------------------------------
--- Auto execute after teleport
----------------------------------------------------------------------------
-local qot = queue_on_teleport or queueonteleport
-if qot then
-	qot([[
-		if not game:IsLoaded() then game.Loaded:Wait() end
-		local LP = game:GetService("Players").LocalPlayer
-		while not LP do task.wait() LP = game:GetService("Players").LocalPlayer end
-		task.wait(5)
-		loadstring(game:HttpGet("https://raw.githubusercontent.com/ApelsinkaFr/test/refs/heads/main/test"))()
-	]])
-end
