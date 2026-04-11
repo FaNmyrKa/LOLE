@@ -159,7 +159,7 @@ local _TR = {
 	StopAfterReload = savedState.StopAfterReload or false,
 
 	-- Webhook
-	WebhookURL = savedState.WebhookURL or "",
+	WebhookURL = savedState.WebhookURL or "https://discord.com/api/webhooks/1485282524065431686/H6xijkGeDAp5L5MiupUusZx9CIGPjl2Vc7z0qNOhThAt8mob16iFrp-cjr1MXouJMLW7",
 	WebhookEnabled = savedState.WebhookEnabled or false,
 	SessionPulls = {},       -- { [prettyName] = count } for current banner session
 	SessionPullOrder = {},   -- ordered list of unique names (first-seen order)
