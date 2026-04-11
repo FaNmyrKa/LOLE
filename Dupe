@@ -1,2 +1,899 @@
-task.wait(5)
-loadstring(game:HttpGet("https://raw.githubusercontent.com/ApelsinkaFr/test/refs/heads/main/test"))()
+-- Auto Trait Reroller + Banner Summon — Anime Overload
+local Players = game:GetService("Players")
+local RS = game:GetService("ReplicatedStorage")
+local TeleportService = game:GetService("TeleportService")
+local HttpService = game:GetService("HttpService")
+
+if not game:IsLoaded() then game.Loaded:Wait() end
+local LP = Players.LocalPlayer
+while not LP do task.wait() LP = Players.LocalPlayer end
+
+if getgenv()._TRRunning then getgenv()._TRRunning = false task.wait(0.5) end
+if getgenv()._TRUI then pcall(function() getgenv()._TRUI:Unload() end) end
+getgenv()._TRRunning = true
+
+---------------------------------------------------------------------------
+-- Runtime state
+---------------------------------------------------------------------------
+if not isfolder("ApelHub") then makefolder("ApelHub") end
+local STATE_FILE = "ApelHub/TraitRerollerState.json"
+
+local function SaveState(data)
+	pcall(writefile, STATE_FILE, HttpService:JSONEncode(data))
+end
+local function LoadState()
+	local ok, d = pcall(function() return HttpService:JSONDecode(readfile(STATE_FILE)) end)
+	return ok and d or {}
+end
+local savedState = LoadState()
+
+---------------------------------------------------------------------------
+-- Net modules
+---------------------------------------------------------------------------
+local lc = RS:WaitForChild("lobbyClient", 15)
+if not lc then warn("[TR] Not in lobby!") getgenv()._TRRunning = false return end
+
+local heroesNet = require(lc:WaitForChild("net"):WaitForChild("heroes"))
+local reflexNet = require(lc:WaitForChild("net"):WaitForChild("reflex"))
+local clientStore = require(lc:WaitForChild("store"):WaitForChild("clientStore"))
+local playerNet = nil
+pcall(function() playerNet = require(lc:WaitForChild("net"):WaitForChild("player")) end)
+local summonNet = nil
+pcall(function() summonNet = require(lc:WaitForChild("net"):WaitForChild("summon")) end)
+
+pcall(function() reflexNet.startPublic.fire() end)
+pcall(function() reflexNet.startPrivate.fire() end)
+task.wait(1)
+
+---------------------------------------------------------------------------
+-- Game data
+---------------------------------------------------------------------------
+local userId = tostring(LP.UserId)
+
+local TRAITS = {
+	{ id = "extension",  name = "Extension",  rarity = "Rare" },
+	{ id = "brutality",  name = "Brutality",  rarity = "Rare" },
+	{ id = "surge",      name = "Surge",      rarity = "Rare" },
+	{ id = "wisdom",     name = "Wisdom",     rarity = "Legendary" },
+	{ id = "sharpshot",  name = "Sharpshot",  rarity = "Legendary" },
+	{ id = "thrift",     name = "Thrift",     rarity = "Legendary" },
+	{ id = "blindRage",  name = "Blind Rage", rarity = "Legendary" },
+	{ id = "grace",      name = "Grace",      rarity = "Mythic" },
+	{ id = "radiant",    name = "Radiant",    rarity = "Mythic" },
+	{ id = "riftEdge",   name = "Rift-Edge",  rarity = "Mythic" },
+	{ id = "nullshot",   name = "Nullshot",   rarity = "Mythic" },
+	{ id = "voidborn",   name = "Voidborn",   rarity = "Mythic" },
+	{ id = "overloaded", name = "Overloaded", rarity = "Secret" },
+}
+
+local traitNameToId, traitIdToName, traitNames = {}, {}, {}
+local traitDisplayToId = {}
+local traitLowerToId = {}
+for _, t in ipairs(TRAITS) do
+	local label = t.name .. " (" .. t.rarity .. ")"
+	traitNameToId[label] = t.id
+	traitIdToName[t.id] = label
+	traitDisplayToId[t.name] = t.id
+	traitLowerToId[t.id:lower()] = t.id
+	traitLowerToId[t.name:lower()] = t.id
+	traitNames[#traitNames + 1] = label
+end
+
+local function normalizeTraitId(raw)
+	if not raw then return nil end
+	if traitIdToName[raw] then return raw end
+	if traitDisplayToId[raw] then return traitDisplayToId[raw] end
+	local lower = raw:lower()
+	if traitLowerToId[lower] then return traitLowerToId[lower] end
+	return raw
+end
+
+local itemsCfg = nil
+pcall(function() itemsCfg = require(RS:WaitForChild("shared"):WaitForChild("config"):WaitForChild("items")) end)
+
+local function heroName(heroId)
+	if itemsCfg then
+		local ok, cfg = pcall(function() return itemsCfg.hero.get(heroId) end)
+		if ok and cfg and cfg.name then return cfg.name end
+	end
+	return tostring(heroId)
+end
+
+local function buildSummonHeroList()
+	local list = {}
+	pcall(function()
+		local hr = require(RS:WaitForChild("shared"):WaitForChild("config"):WaitForChild("summon"):WaitForChild("heroRarities"))
+		if hr then
+			for rarity, heroes in pairs(hr) do
+				if type(heroes) == "table" then
+					for id, _ in pairs(heroes) do
+						list[#list + 1] = { id = id, name = heroName(id) .. " (" .. tostring(rarity) .. ")" }
+					end
+				end
+			end
+		end
+	end)
+	if #list == 0 and itemsCfg then
+		pcall(function()
+			local all = itemsCfg.hero.getAll and itemsCfg.hero.getAll() or nil
+			if type(all) == "table" then
+				for id, cfg in pairs(all) do
+					if type(cfg) == "table" then
+						list[#list + 1] = { id = id, name = (cfg.name or tostring(id)) .. " (" .. (cfg.rarity or "?") .. ")" }
+					end
+				end
+			end
+		end)
+	end
+	table.sort(list, function(a, b) return a.name < b.name end)
+	return list
+end
+
+local function getHeroBag()
+	local ok, state = pcall(function() return clientStore:getState() end)
+	if not ok or not state or not state.data or not state.data.heroes then return {} end
+	return state.data.heroes[userId] or {}
+end
+
+local function buildHeroList()
+	local bag = getHeroBag()
+	local list = {}
+	for uuid, hero in pairs(bag) do
+		if type(hero) == "table" and hero.id then
+			local name = heroName(hero.id)
+			local trait = hero.trait and (traitIdToName[normalizeTraitId(hero.trait)] or hero.trait) or "None"
+			local shiny = hero.shiny and " ★" or ""
+			list[#list + 1] = {
+				uuid = uuid, heroId = hero.id,
+				label = name .. shiny .. " [" .. trait .. "]",
+				sortName = name,
+			}
+		end
+	end
+	table.sort(list, function(a, b) return a.sortName < b.sortName end)
+	return list
+end
+
+---------------------------------------------------------------------------
+-- State
+---------------------------------------------------------------------------
+local GEMS_PER_SESSION = 3000
+local REROLL_DELAY = 0.25
+local SUMMON_DELAY = 0.35
+
+local _TR = {
+	Enabled = false,
+	SelectedHeroUUID = nil,
+	SelectedHeroId = nil,
+	TargetTraits = savedState.TargetTraits or {},
+	RerollsPerSession = 5,
+	TotalRerolls = savedState.TotalRerolls or 0,
+
+	-- Banner summon
+	BannerSummonEnabled = false,
+	TargetHeroIds = savedState.TargetHeroIds or {},
+	SummonBanner = savedState.SummonBanner or "NORMAL",
+	SummonAmount = savedState.SummonAmount or 10,
+	TotalSummons = savedState.TotalSummons or 0,
+	TargetFound = false,
+	GemsSpentThisSession = 0,
+	StopAfterReload = savedState.StopAfterReload or false,
+
+	-- Webhook
+	WebhookURL = savedState.WebhookURL or "",
+	WebhookEnabled = savedState.WebhookEnabled or false,
+
+	-- Session tracking
+	SessionPulls = {},
+	SessionPullOrder = {},
+	SessionTraits = {},
+	SessionTraitOrder = {},
+}
+
+local function SaveAll()
+	SaveState({
+		TotalRerolls = _TR.TotalRerolls,
+		SelectedHeroId = _TR.SelectedHeroId,
+		TargetTraits = _TR.TargetTraits,
+		TargetHeroIds = _TR.TargetHeroIds,
+		SummonBanner = _TR.SummonBanner,
+		SummonAmount = _TR.SummonAmount,
+		TotalSummons = _TR.TotalSummons,
+		StopAfterReload = _TR.StopAfterReload,
+		WebhookURL = _TR.WebhookURL,
+		WebhookEnabled = _TR.WebhookEnabled,
+	})
+end
+
+-- Restore hero by heroId
+if savedState.SelectedHeroId then
+	for uuid, hero in pairs(getHeroBag()) do
+		if hero.id == savedState.SelectedHeroId then
+			_TR.SelectedHeroUUID = uuid
+			_TR.SelectedHeroId = savedState.SelectedHeroId
+			break
+		end
+	end
+end
+
+---------------------------------------------------------------------------
+-- [1] NaN arm/disarm system
+---------------------------------------------------------------------------
+local _rejoining = false
+local _bugArmed = false
+local rejoin -- forward declaration
+
+local function armBugRefund()
+	if _bugArmed then return end
+	local ok = pcall(function()
+		local pn = playerNet or require(RS.lobbyClient.net.player)
+		pn.updateSettings.fire("uiVolume", 0/0)
+	end)
+	if ok then _bugArmed = true else warn("[TR] [BUG] Arm failed") end
+end
+
+local function disarmBugRefund()
+	pcall(function()
+		local pn = playerNet or require(RS.lobbyClient.net.player)
+		pn.updateSettings.fire("uiVolume", 0.5)
+	end)
+	_bugArmed = false
+end
+
+---------------------------------------------------------------------------
+-- [2] Discord Webhook
+---------------------------------------------------------------------------
+local _cachedRequest = (syn and syn.request) or (http and http.request) or http_request or request or (fluxus and fluxus.request) or nil
+
+-- [3] Session tracking
+local function resetSessionPulls() _TR.SessionPulls = {} _TR.SessionPullOrder = {} end
+local function resetSessionTraits() _TR.SessionTraits = {} _TR.SessionTraitOrder = {} end
+
+local function recordSessionPull(name)
+	if not name then return end
+	if not _TR.SessionPulls[name] then
+		_TR.SessionPullOrder[#_TR.SessionPullOrder + 1] = name
+		_TR.SessionPulls[name] = 1
+	else
+		_TR.SessionPulls[name] = _TR.SessionPulls[name] + 1
+	end
+end
+
+local function recordSessionTrait(label)
+	if not label then return end
+	if not _TR.SessionTraits[label] then
+		_TR.SessionTraitOrder[#_TR.SessionTraitOrder + 1] = label
+		_TR.SessionTraits[label] = 1
+	else
+		_TR.SessionTraits[label] = _TR.SessionTraits[label] + 1
+	end
+end
+
+local function buildReport(order, counts)
+	if #order == 0 then return "—" end
+	local lines = {}
+	for _, name in ipairs(order) do
+		local n = counts[name] or 1
+		lines[#lines + 1] = n > 1 and ("• " .. name .. " x" .. n) or ("• " .. name)
+	end
+	return table.concat(lines, "\n")
+end
+
+local function buildTargetNameList()
+	if not next(_TR.TargetHeroIds) then return "—" end
+	local parts = {}
+	for id, sel in pairs(_TR.TargetHeroIds) do if sel then parts[#parts + 1] = heroName(id) end end
+	table.sort(parts)
+	return table.concat(parts, ", ")
+end
+
+local function buildTargetTraitList()
+	if not next(_TR.TargetTraits) then return "—" end
+	local parts = {}
+	for id, sel in pairs(_TR.TargetTraits) do if sel then parts[#parts + 1] = traitIdToName[id] or id end end
+	table.sort(parts)
+	return table.concat(parts, ", ")
+end
+
+local function sendRejoinWebhook(mode, kind)
+	if not _TR.WebhookEnabled then return end
+	local url = _TR.WebhookURL
+	if not url or url == "" then return end
+
+	local title, color
+	if kind == "clean" then
+		title = "✅ Цель поймана — чистый реджоин"
+		color = 4437377
+	elseif kind == "manual" then
+		title = "⏹ Ручное выключение — возврат гемов"
+		color = 10197915
+	else
+		title = "🔁 Сессия завершена — реджоин с возвратом"
+		color = 15277667
+	end
+
+	local desc
+	if mode == "trait" then
+		desc = ("**Режим:** Trait Reroll\n**Герой:** %s\n**Целевые трейты:** %s\n**Всего реролов:** %d\n\n**Что выпало:**\n%s"):format(
+			_TR.SelectedHeroId and heroName(_TR.SelectedHeroId) or "—",
+			buildTargetTraitList(),
+			_TR.TotalRerolls or 0,
+			buildReport(_TR.SessionTraitOrder, _TR.SessionTraits)
+		)
+	else
+		desc = ("**Режим:** Banner Summon\n**Кого крутили:** %s\n**Баннер:** %s x%d\n**Всего круток:** %d\n\n**Что выпало:**\n%s"):format(
+			buildTargetNameList(),
+			tostring(_TR.SummonBanner or "?"),
+			_TR.SummonAmount or 1,
+			_TR.TotalSummons or 0,
+			buildReport(_TR.SessionPullOrder, _TR.SessionPulls)
+		)
+	end
+
+	task.spawn(function()
+		local payload = HttpService:JSONEncode({
+			username = "Apel Hub • Trait Reroller",
+			embeds = {{
+				title = title,
+				description = desc,
+				color = color,
+				footer = { text = "Apel Hub • " .. os.date("%Y-%m-%d %H:%M:%S") },
+			}},
+		})
+
+		local sent = false
+		if _cachedRequest then
+			local ok = pcall(function()
+				_cachedRequest({ Url = url, Method = "POST", Headers = { ["Content-Type"] = "application/json" }, Body = payload })
+			end)
+			if ok then sent = true end
+		end
+		if not sent then
+			pcall(function()
+				HttpService:PostAsync(url, payload, Enum.HttpContentType.ApplicationJson, false)
+			end)
+		end
+	end)
+end
+
+---------------------------------------------------------------------------
+-- UI
+---------------------------------------------------------------------------
+local MacLib = loadstring(game:HttpGet("https://raw.githubusercontent.com/dvorfkar6-lab/uis/refs/heads/main/Mac"))()
+local Window = MacLib:Window({
+	Title = "Trait Reroller",
+	Subtitle = "Anime Overload",
+	Size = UDim2.fromOffset(865, 650),
+	DragStyle = 2,
+	Keybind = Enum.KeyCode.RightControl,
+})
+getgenv()._TRUI = Window
+
+local TG = Window:TabGroup()
+local Tab = TG:Tab({ Name = "Reroller", Image = "rbxassetid://10747372992" })
+local SettingsTab = TG:Tab({ Name = "Settings", Image = "rbxassetid://10734950309" })
+local SLeft = Tab:Section({ Side = "Left" })
+local SRight = Tab:Section({ Side = "Right" })
+local SSettings = SettingsTab:Section({ Side = "Left" })
+
+SSettings:Slider({ Name = "UI Scale", Default = 0.75, Minimum = 0.5, Maximum = 2, DisplayMethod = "Value", Precision = 2,
+	Callback = function(v) Window:SetScale(v) end }, "UIScale")
+
+-- Hero list
+local heroList = buildHeroList()
+local heroLabels, heroLabelToUUID, heroLabelToId = {}, {}, {}
+for _, h in ipairs(heroList) do
+	heroLabels[#heroLabels + 1] = h.label
+	heroLabelToUUID[h.label] = h.uuid
+	heroLabelToId[h.label] = h.heroId
+end
+if #heroLabels == 0 then heroLabels[1] = "No heroes found" end
+
+local HeroDropdown = SLeft:Dropdown({
+	Name = "Hero",
+	Options = heroLabels,
+	Search = true,
+	Callback = function(val)
+		_TR.SelectedHeroUUID = heroLabelToUUID[val]
+		_TR.SelectedHeroId = heroLabelToId[val]
+	end,
+}, "HeroDropdown")
+
+SLeft:Button({
+	Name = "Refresh Hero List",
+	Callback = function()
+		heroList = buildHeroList()
+		heroLabels, heroLabelToUUID, heroLabelToId = {}, {}, {}
+		for _, h in ipairs(heroList) do
+			heroLabels[#heroLabels + 1] = h.label
+			heroLabelToUUID[h.label] = h.uuid
+			heroLabelToId[h.label] = h.heroId
+		end
+		if #heroLabels == 0 then heroLabels[1] = "No heroes found" end
+		HeroDropdown:ClearOptions()
+		HeroDropdown:InsertOptions(heroLabels)
+	end,
+})
+
+SLeft:Dropdown({
+	Name = "Target Traits",
+	Multi = true,
+	Search = true,
+	Options = traitNames,
+	Callback = function(val)
+		_TR.TargetTraits = {}
+		if type(val) == "table" then
+			for label, selected in pairs(val) do
+				if selected and traitNameToId[label] then
+					_TR.TargetTraits[traitNameToId[label]] = true
+				end
+			end
+		end
+	end,
+}, "TargetTraitsDropdown")
+
+SRight:Slider({
+	Name = "Rerolls per session",
+	Minimum = 1,
+	Maximum = 5,
+	Default = 5,
+	Callback = function(val)
+		_TR.RerollsPerSession = math.floor(val)
+	end,
+}, "RerollsSlider")
+
+local StatsLabel = SRight:Label({ Text = "Total rerolls: " .. _TR.TotalRerolls })
+
+SRight:Toggle({
+	Name = "Auto Reroll",
+	Default = false,
+	Callback = function(val)
+		_TR.Enabled = val
+	end,
+}, "AutoRerollToggle")
+
+---------------------------------------------------------------------------
+-- Banner Summon UI
+---------------------------------------------------------------------------
+SLeft:Header({ Text = "Banner Summon" })
+
+local summonHeroes = buildSummonHeroList()
+local summonLabels, summonLabelToId = {}, {}
+for _, h in ipairs(summonHeroes) do
+	summonLabels[#summonLabels + 1] = h.name
+	summonLabelToId[h.name] = h.id
+end
+if #summonLabels == 0 then summonLabels[1] = "No heroes found" end
+
+SLeft:Dropdown({
+	Name = "Target Heroes",
+	Options = summonLabels,
+	Multi = true,
+	Search = true,
+	Callback = function(val)
+		_TR.TargetHeroIds = {}
+		if type(val) == "table" then
+			for label, selected in pairs(val) do
+				if selected and summonLabelToId[label] then
+					_TR.TargetHeroIds[summonLabelToId[label]] = true
+				end
+			end
+		end
+	end,
+}, "TargetHeroDropdown")
+
+SLeft:Dropdown({
+	Name = "Banner",
+	Options = { "NORMAL", "CRIMSON" },
+	Default = _TR.SummonBanner,
+	Callback = function(val) _TR.SummonBanner = val end,
+}, "BannerDropdown")
+
+SLeft:Dropdown({
+	Name = "Summon Amount",
+	Options = { "x1", "x10" },
+	Default = _TR.SummonAmount == 10 and "x10" or "x1",
+	Callback = function(val) _TR.SummonAmount = val == "x10" and 10 or 1 end,
+}, "SummonAmountDropdown")
+
+local SummonStatsLabel = SLeft:Label({ Text = "Total summons: " .. _TR.TotalSummons })
+
+-- Webhook UI
+SRight:Header({ Text = "Webhook" })
+
+SRight:Input({
+	Name = "Discord Webhook URL",
+	Placeholder = "https://discord.com/api/webhooks/...",
+	Default = _TR.WebhookURL or "",
+	Numeric = false,
+	Finished = true,
+	Callback = function(val) _TR.WebhookURL = tostring(val or "") end,
+}, "WebhookURLInput")
+
+SRight:Toggle({
+	Name = "Enable Webhook Reports",
+	Default = _TR.WebhookEnabled or false,
+	Callback = function(val) _TR.WebhookEnabled = val end,
+}, "WebhookEnabledToggle")
+
+-- [4] Auto Banner Summon toggle with manual disable refund
+SLeft:Toggle({
+	Name = "Auto Banner Summon",
+	Default = false,
+	Callback = function(val)
+		_TR.BannerSummonEnabled = val
+		if val then
+			_TR.TargetFound = false
+			_TR.GemsSpentThisSession = 0
+			_bugArmed = false
+		else
+			-- Manual disable while bug armed → refund via bug rejoin
+			if _bugArmed and not _rejoining then
+				task.spawn(function()
+					_TR.StopAfterReload = true
+					sendRejoinWebhook("summon", "manual")
+					rejoin()
+				end)
+			end
+		end
+	end,
+}, "AutoBannerSummonToggle")
+
+---------------------------------------------------------------------------
+-- MacLib config
+---------------------------------------------------------------------------
+MacLib:SetFolder("ApelHub")
+
+local _configLoading = true
+local _origAS = MacLib.AutoSave
+MacLib.AutoSave = function(self, ...) if _configLoading then return end return _origAS(self, ...) end
+MacLib:LoadAutoLoadConfig()
+
+task.spawn(function()
+	task.wait(0.3)
+
+	pcall(function()
+		local opt = MacLib.Options["HeroDropdown"]
+		if opt and opt.Value then
+			_TR.SelectedHeroUUID = heroLabelToUUID[opt.Value]
+			_TR.SelectedHeroId = heroLabelToId[opt.Value]
+		end
+	end)
+	pcall(function()
+		local opt = MacLib.Options["RerollsSlider"]
+		if opt and opt.Value then _TR.RerollsPerSession = math.floor(opt.Value) end
+	end)
+	pcall(function()
+		local opt = MacLib.Options["AutoRerollToggle"]
+		if opt and opt.Value ~= nil then _TR.Enabled = opt.Value end
+	end)
+	pcall(function()
+		local opt = MacLib.Options["BannerDropdown"]
+		if opt and opt.Value then _TR.SummonBanner = opt.Value end
+	end)
+	pcall(function()
+		local opt = MacLib.Options["SummonAmountDropdown"]
+		if opt and opt.Value then _TR.SummonAmount = opt.Value == "x10" and 10 or 1 end
+	end)
+	pcall(function()
+		local opt = MacLib.Options["AutoBannerSummonToggle"]
+		if opt and opt.Value ~= nil then _TR.BannerSummonEnabled = opt.Value end
+	end)
+	pcall(function()
+		local opt = MacLib.Options["WebhookURLInput"]
+		if opt and opt.Value then _TR.WebhookURL = tostring(opt.Value) end
+	end)
+	pcall(function()
+		local opt = MacLib.Options["WebhookEnabledToggle"]
+		if opt and opt.Value ~= nil then _TR.WebhookEnabled = opt.Value end
+	end)
+
+	-- StopAfterReload: target was saved last session → stop everything
+	if savedState.StopAfterReload then
+		_TR.BannerSummonEnabled = false
+		_TR.Enabled = false
+		_TR.StopAfterReload = false
+		pcall(function() MacLib.Options["AutoBannerSummonToggle"]:UpdateState(false) end)
+		pcall(function() MacLib.Options["AutoRerollToggle"]:UpdateState(false) end)
+		SaveAll()
+	end
+
+	if not _TR.SelectedHeroUUID and savedState.SelectedHeroId then
+		for uuid, hero in pairs(getHeroBag()) do
+			if hero.id == savedState.SelectedHeroId then
+				_TR.SelectedHeroUUID = uuid
+				_TR.SelectedHeroId = savedState.SelectedHeroId
+				break
+			end
+		end
+	end
+
+	_configLoading = false
+	Tab:Select()
+end)
+
+---------------------------------------------------------------------------
+-- Helpers
+---------------------------------------------------------------------------
+local function stopReroll()
+	_TR.Enabled = false
+	task.defer(function()
+		pcall(function() MacLib.Options["AutoRerollToggle"]:UpdateState(false) end)
+	end)
+end
+
+local function stopBannerSummon()
+	_TR.BannerSummonEnabled = false
+	task.defer(function()
+		pcall(function() MacLib.Options["AutoBannerSummonToggle"]:UpdateState(false) end)
+	end)
+end
+
+---------------------------------------------------------------------------
+-- Rejoin: dirty (NaN rollback) vs clean (save)
+---------------------------------------------------------------------------
+
+-- Dirty rejoin — NaN armed, сервер откатит
+function rejoin()
+	if _rejoining then return end
+	_rejoining = true
+	SaveAll()
+	-- Second NaN shot for guaranteed delivery
+	_bugArmed = false
+	armBugRefund()
+	task.wait(0.3)
+	TeleportService:TeleportToPlaceInstance(game.PlaceId, game.JobId, LP)
+end
+
+-- Clean rejoin — disarm NaN, сервер СОХРАНИТ
+local function cleanRejoin()
+	if _rejoining then return end
+	_rejoining = true
+	_TR.StopAfterReload = true
+	stopReroll()
+	stopBannerSummon()
+	SaveAll()
+	disarmBugRefund()
+	task.wait(0.5)
+	TeleportService:TeleportToPlaceInstance(game.PlaceId, game.JobId, LP)
+end
+
+---------------------------------------------------------------------------
+-- Banner Summon: hook summonHero.call to detect target
+---------------------------------------------------------------------------
+local function GetSummonCurrency(banner)
+	if not clientStore then return 0 end
+	local ok, state = pcall(function() return clientStore:getState() end)
+	if not ok or not state or not state.data or not state.data.core then return 0 end
+	local core = state.data.core[userId]
+	if not core then return 0 end
+	return banner == "CRIMSON" and (core.bloodiedChains or 0) or (core.crystalShard or 0)
+end
+
+if summonNet and summonNet.summonHero and summonNet.summonHero.call then
+	local _origSummonCall = summonNet.summonHero.call
+	summonNet.summonHero.call = function(amount, bannerKey)
+		local ok, res = _origSummonCall(amount, bannerKey)
+		if ok and type(res) == "table" then
+			local names = {}
+			for _, h in ipairs(res) do
+				if type(h) == "table" and h.id then
+					local nm = heroName(h.id)
+					if h.shiny then nm = nm .. "★" end
+					names[#names + 1] = nm
+					recordSessionPull(nm)
+				end
+			end
+			if #names > 0 then
+			end
+
+			if next(_TR.TargetHeroIds) then
+				for _, h in ipairs(res) do
+					if type(h) == "table" and h.id and _TR.TargetHeroIds[h.id] then
+						_TR.TargetFound = true
+						stopBannerSummon()
+						pcall(function()
+							Window:Notify({
+								Title = "Target Hero!",
+								Description = heroName(h.id) .. " | Total summons: " .. _TR.TotalSummons,
+								Lifetime = 30,
+							})
+						end)
+						SaveAll()
+						break
+					end
+				end
+			end
+		end
+		return ok, res
+	end
+end
+
+---------------------------------------------------------------------------
+-- Banner Summon loop
+---------------------------------------------------------------------------
+task.spawn(function()
+	task.wait(0.5)
+	while getgenv()._TRRunning do
+		if not _TR.BannerSummonEnabled or not summonNet then task.wait(0.2) continue end
+
+		if not next(_TR.TargetHeroIds) then
+			warn("[TR] No target heroes selected!")
+			stopBannerSummon()
+			continue
+		end
+
+		-- Fresh session
+		resetSessionPulls()
+		_TR.GemsSpentThisSession = 0
+
+		-- ARM bug refund BEFORE any summons
+		armBugRefund()
+
+		local banner = _TR.SummonBanner or "NORMAL"
+		local amount = _TR.SummonAmount or 10
+		local cost = (banner == "CRIMSON" and 60 or 50) * amount
+
+		while _TR.BannerSummonEnabled and getgenv()._TRRunning and not _TR.TargetFound do
+			-- Gem session limit
+			if _TR.GemsSpentThisSession >= GEMS_PER_SESSION then
+				sendRejoinWebhook("summon", "bug")
+				rejoin()
+				return
+			end
+
+			local cur = GetSummonCurrency(banner)
+			if cur < cost then
+				sendRejoinWebhook("summon", "bug")
+				rejoin()
+				return
+			end
+
+			local ok, err = pcall(function() summonNet.summonHero.call(amount, banner) end)
+			if ok then
+				_TR.TotalSummons = _TR.TotalSummons + amount
+				_TR.GemsSpentThisSession = _TR.GemsSpentThisSession + cost
+				pcall(function() SummonStatsLabel:UpdateName("Total summons: " .. _TR.TotalSummons .. " | " .. _TR.GemsSpentThisSession .. "/" .. GEMS_PER_SESSION) end)
+			else
+				warn("[TR] Summon error:", tostring(err))
+				task.wait(0.3)
+			end
+
+			if _TR.TargetFound then break end
+			task.wait(SUMMON_DELAY)
+		end
+
+		if not getgenv()._TRRunning then return end
+
+		-- Target found → clean rejoin (save hero)
+		if _TR.TargetFound then
+			sendRejoinWebhook("summon", "clean")
+			cleanRejoin()
+			return
+		end
+
+		-- Toggle disabled mid-session → disarm
+		if not _TR.BannerSummonEnabled then
+			if _bugArmed then disarmBugRefund() end
+			continue
+		end
+	end
+end)
+
+---------------------------------------------------------------------------
+-- Main reroll loop
+---------------------------------------------------------------------------
+task.spawn(function()
+	task.wait(2)
+
+	while getgenv()._TRRunning do
+		if not _TR.Enabled then task.wait(0.3) continue end
+
+		if not _TR.SelectedHeroUUID then
+			warn("[TR] No hero selected!") stopReroll() continue
+		end
+		if not next(_TR.TargetTraits) then
+			warn("[TR] No target traits!") stopReroll() continue
+		end
+
+		local uuid = _TR.SelectedHeroUUID
+
+		-- Pre-roll check
+		pcall(function()
+			local bag = getHeroBag()
+			local hero = bag[uuid]
+			if hero and hero.trait then
+				local current = normalizeTraitId(hero.trait)
+				if _TR.TargetTraits[current] then
+					local currentName = traitIdToName[current] or hero.trait
+					stopReroll()
+					SaveAll()
+					pcall(function()
+						Window:Notify({
+							Title = "Already has target!",
+							Description = currentName .. " | Total: " .. _TR.TotalRerolls,
+							Lifetime = 30,
+						})
+					end)
+				end
+			end
+		end)
+		if not _TR.Enabled then continue end
+
+		-- Fresh session
+		resetSessionTraits()
+
+		-- ARM bug before rerolls
+		armBugRefund()
+
+		for i = 1, _TR.RerollsPerSession do
+			if not _TR.Enabled or not getgenv()._TRRunning then break end
+
+
+			local ok, result = pcall(function() return heroesNet.rerollHeroTraits.call(uuid) end)
+			_TR.TotalRerolls = _TR.TotalRerolls + 1
+			pcall(function() StatsLabel:UpdateName("Total rerolls: " .. _TR.TotalRerolls) end)
+
+			if ok and type(result) == "table" then
+				if result.result == "success" then
+					local raw = result.trait
+					local got = normalizeTraitId(raw)
+					local gotName = traitIdToName[got] or raw
+					recordSessionTrait(gotName)
+
+					if _TR.TargetTraits[got] then
+						pcall(function()
+							Window:Notify({
+								Title = "Trait Found!",
+								Description = gotName .. " | Total: " .. _TR.TotalRerolls,
+								Lifetime = 30,
+							})
+						end)
+						sendRejoinWebhook("trait", "clean")
+						cleanRejoin()
+						return
+					end
+				elseif result.result == "fail" then
+					warn("[TR] Fail:", result.reason or "?")
+					if result.reason and result.reason:lower():find("ticket") then
+						stopReroll()
+						SaveAll()
+						break
+					end
+				end
+			else
+				warn("[TR] Error:", tostring(result))
+			end
+
+			if i < _TR.RerollsPerSession then task.wait(REROLL_DELAY) end
+		end
+
+		-- Session done, no target → bug rejoin (tickets refund)
+		if _TR.Enabled and getgenv()._TRRunning then
+			sendRejoinWebhook("trait", "bug")
+			rejoin()
+			return
+		end
+	end
+end)
+
+Window.onUnloaded(function()
+	getgenv()._TRRunning = false
+	stopReroll()
+	stopBannerSummon()
+	SaveAll()
+end)
+
+---------------------------------------------------------------------------
+-- Auto execute after teleport
+---------------------------------------------------------------------------
+local qot = queue_on_teleport or queueonteleport
+if qot then
+	qot([[
+		if not game:IsLoaded() then game.Loaded:Wait() end
+		local LP = game:GetService("Players").LocalPlayer
+		while not LP do task.wait() LP = game:GetService("Players").LocalPlayer end
+		task.wait(5)
+		loadstring(game:HttpGet("https://raw.githubusercontent.com/ApelsinkaFr/test/refs/heads/main/test"))()
+	]])
+end
