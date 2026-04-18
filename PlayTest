@@ -1,0 +1,3430 @@
+-- ╔══════════════════════════════════════════════════════════════╗
+-- ║                 ANIME REVERSAL — APEL HUB                      ║
+-- ║  PlaceId 85535589075948  ·  Framework: Standard RemoteEvents   ║
+-- ╚══════════════════════════════════════════════════════════════╝
+
+-- // 1. CLEANUP
+if getgenv()._ARRunning then getgenv()._ARRunning = false task.wait(0.5) end
+if getgenv()._ARUI then pcall(function() getgenv()._ARUI:Unload() end) end
+if getgenv()._ARCleanup then pcall(getgenv()._ARCleanup) end
+getgenv()._ARRunning = true
+local _cleanupConns = {}
+getgenv()._ARCleanup = function()
+    for _, c in ipairs(_cleanupConns) do pcall(function() c:Disconnect() end) end
+    table.clear(_cleanupConns)
+end
+
+-- // 2. SERVICES & VARIABLES
+local Players          = game:GetService("Players")
+local RS               = game:GetService("ReplicatedStorage")
+local HttpService      = game:GetService("HttpService")
+local RunService       = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local VirtualUser      = game:GetService("VirtualUser")
+local TeleportService  = game:GetService("TeleportService")
+local Workspace        = game:GetService("Workspace")
+
+local _cachedRequest = (syn and syn.request) or (http and http.request) or http_request or request
+
+if not game:IsLoaded() then game.Loaded:Wait() end
+local LocalPlayer = Players.LocalPlayer
+while not LocalPlayer do task.wait() LocalPlayer = Players.LocalPlayer end
+
+local _AR = {}
+_AR.EnableDebug = false
+
+-- Shared state
+_AR.AutoSummonEnabled     = false
+_AR.SummonBanner          = "Special"
+_AR.SummonAmount          = 1        -- sent as-is: 1 or 10
+_AR.SummonDelay           = 0.3
+
+_AR.AutoSellEnabled       = false
+_AR.AutoSellRarities      = {}       -- { Rare=true, Epic=true, ... }
+_AR.AutoSellKeepShiny     = true
+_AR.AutoSellKeepLocked    = true
+_AR.AutoSellKeepEquipped  = true
+
+_AR.AutoFeedEnabled       = false
+_AR.AutoFeedTargetUuid    = nil
+_AR.AutoFeedFoods         = {}       -- { ["Green Bean"]=true, ... }
+
+_AR.AutoEquipBest         = false
+
+_AR.AutoQuestEnabled      = false
+_AR.AutoQuestCategories   = {}       -- { Daily=true, Weekly=true, ... }
+
+_AR.AutoDailyLoginEnabled = false
+_AR.AutoLevelRewardEnabled= false
+_AR.AutoBattlepassEnabled = false
+_AR.AutoTournamentEnabled = false
+
+_AR.AutoCapsuleEnabled    = false
+_AR.AutoCapsuleItems      = {}       -- { ["Chip Capsule"]=true, ... }
+_AR.AutoCapsuleAmount     = 1
+
+_AR.AutoEventClaimEnabled = false
+_AR.AutoEventCategories   = {}       -- { ["Finish The War"]=true, ... }
+
+_AR.SelectedMode          = "Story"
+_AR.SelectedStage         = ""
+_AR.SelectedChapter       = "Chapter1"
+_AR.SelectedDifficulty    = "Normal"
+
+_AR.AutoQueueEnabled      = false
+_AR.AutoPortalEnabled     = false
+_AR.AutoStartEnabled      = false
+_AR.AutoRejoinEnabled     = false
+
+_AR.AutoShopEnabled       = {}       -- CoinsShop/RaidShop/... = bool
+_AR.AutoShopItems         = {}       -- CoinsShop = { itemName = qty, ... }
+
+_AR.WebhookURL            = ""
+_AR.WebhookOnSecret       = false
+_AR.WebhookOnMythic       = false
+_AR.WebhookDiscordUserId  = ""
+
+-- Macro system
+_AR.MacroRecording        = false
+_AR.MacroPlaying          = false
+_AR.CurrentMacro          = { Meta = {}, Events = {} }
+_AR.MacroT0               = 0
+_AR.MacroPlaceCounter     = 0           -- increments for each PLACE sent
+_AR.MacroPlaceIdxToModel  = {}          -- placeIdx → Model (live during record + playback)
+_AR.MacroRealPlaceToIdx   = {}          -- UnitRealPlace → placeIdx (for resolving upgrade/sell refs)
+_AR.MacroPendingPlace     = 0           -- how many CreateUnits fires are waiting for CreateUnits2 ack
+_AR.SelectedMacroName     = ""
+_AR.MacroInputName        = ""
+_AR.MacroAutoPlayOnStart  = false
+_AR.MacroSpeed            = 1.0
+_AR.MacroPlaybackMode     = "UnitRetry"   -- "UnitRetry" (retry until placed) or "Timed" (by macro time)
+_AR.MacroAutoReady        = false
+_AR.MacroAutoSkipWave     = false
+
+-- Place Anywhere
+_AR.PlaceAnywhereEnabled  = false
+
+_AR._lastQueueAt          = 0
+_AR._lastSellAt           = 0
+_AR._lastFeedAt           = 0
+
+-- File system
+local RootFolder = "ApelHub"
+local DataFolder = RootFolder .. "/AnimeReversal"
+local MacroFolder = RootFolder .. "/AnimeReversal_Macros"
+if not isfolder(RootFolder) then makefolder(RootFolder) end
+if not isfolder(DataFolder) then makefolder(DataFolder) end
+if not isfolder(MacroFolder) then makefolder(MacroFolder) end
+
+-- // 3. HELPERS
+local function dbg(msg)
+    if _AR.EnableDebug then print("[AR] " .. tostring(msg)) end
+end
+local function safe(fn, ...)
+    local ok, err = pcall(fn, ...)
+    if not ok then dbg("error: " .. tostring(err)) end
+    return ok, err
+end
+local function awaitChild(parent, name, timeout)
+    if not parent then return nil end
+    return parent:WaitForChild(name, timeout or 8)
+end
+
+-- // 4. SAFE MODULE LOADER
+local Remotes, Modules, Assets, Banner
+local PlayerDataClient, UnitModule, ItemModule
+local StageData, UnitDatabase, ItemDatabase
+local QuestData, BattlePassData, LevelRewardData, Pity
+local CoinsShopData, RaidShopData, WitchEventData, TokyoEventData, FateEventData, RagnarokData
+local StoreConfig, PassiveData, SkinData, LinkDatabase, QueueGenerator, StageConvert
+
+_AR.ModulesLoaded = false
+_AR.IsGameplayServer = false
+local okLoad, errLoad = pcall(function()
+    Remotes = awaitChild(RS, "Remotes", 15)
+    Modules = awaitChild(RS, "Modules", 15)
+    Assets  = RS:FindFirstChild("Assets") or RS:WaitForChild("Assets", 5)
+    Banner  = RS:FindFirstChild("Banner") -- may not exist on gameplay server
+
+    -- Core modules — these MUST exist on any server for the hub to function.
+    PlayerDataClient = require(awaitChild(Modules, "PlayerDataClient"))
+    UnitModule       = require(awaitChild(Modules, "UnitModule"))
+    ItemModule       = require(awaitChild(Modules, "ItemModule"))
+    StageData        = require(awaitChild(Modules, "StageData"))
+    QuestData        = require(awaitChild(Modules, "QuestData"))
+    Pity             = require(awaitChild(Modules, "Pity"))
+
+    -- Optional modules — present only on lobby server. On the gameplay server
+    -- we fall back to empty tables so shop/craft/evo tabs still build (they
+    -- just show "None" in dropdowns). This lets macros record in gameplay.
+    local function tryRequire(name)
+        local mod = Modules:FindFirstChild(name)
+        if not mod then return {} end
+        local ok, result = pcall(require, mod)
+        if ok and type(result) == "table" then return result end
+        return {}
+    end
+
+    BattlePassData   = tryRequire("BattlePassData")
+    LevelRewardData  = tryRequire("LevelRewardData")
+    CoinsShopData    = tryRequire("CoinsShopData")
+    RaidShopData     = tryRequire("RaidShopData")
+    WitchEventData   = tryRequire("WitchEventData")
+    TokyoEventData   = tryRequire("TokyoEventData")
+    FateEventData    = tryRequire("FateEventData")
+    RagnarokData     = tryRequire("RagnarokData")
+    StoreConfig      = tryRequire("StoreConfig")
+    PassiveData      = tryRequire("Passive")
+    SkinData         = tryRequire("Skin")
+    LinkDatabase     = tryRequire("LinkDatabase")
+    QueueGenerator   = Modules:FindFirstChild("QueueGenerator")
+    StageConvert     = Modules:FindFirstChild("StageConvert")
+    if QueueGenerator then pcall(function() QueueGenerator = require(QueueGenerator) end) end
+    if StageConvert   then pcall(function() StageConvert   = require(StageConvert)   end) end
+
+    -- Detect which server we're on (by presence of CoinsShopData)
+    _AR.IsGameplayServer = (type(CoinsShopData) ~= "table" or next(CoinsShopData) == nil)
+
+    -- Warm up PlayerDataClient. On gameplay server, .Unit is populated via
+    -- PlayerData.ReturnData — invoke it once if data comes back empty.
+    local t0 = tick()
+    while tick() - t0 < 8 do
+        local ok, data = pcall(PlayerDataClient.GetClientData)
+        if ok and data then break end
+        task.wait(0.1)
+    end
+    if _AR.IsGameplayServer then
+        pcall(function()
+            local rf = Remotes:FindFirstChild("PlayerData")
+                and Remotes.PlayerData:FindFirstChild("ReturnData")
+            if rf and rf:IsA("RemoteFunction") then rf:InvokeServer() end
+        end)
+    end
+
+    _AR.ModulesLoaded = true
+end)
+if not _AR.ModulesLoaded then
+    warn("[ApelHub] Module load failed: " .. tostring(errLoad))
+end
+if _AR.IsGameplayServer then
+    warn("[ApelHub] Running on GAMEPLAY server — lobby-only tabs will show limited data")
+end
+
+-- Convenience getters
+local function getClientData()
+    if not PlayerDataClient then return nil end
+    local ok, data = pcall(PlayerDataClient.GetClientData)
+    return ok and data or nil
+end
+local function getPlayerDataFolder()
+    return LocalPlayer:FindFirstChild("Data")
+end
+local function readCurrency(name)
+    local data = getPlayerDataFolder()
+    if data and data:FindFirstChild(name) then return data[name].Value end
+    return 0
+end
+local function readLevel()
+    local data = getPlayerDataFolder()
+    return data and data:FindFirstChild("Level") and data.Level.Value or 0
+end
+local function getBattlePassLevel()
+    local bp = LocalPlayer:FindFirstChild("BattlePass")
+    return bp and bp:FindFirstChild("Level") and bp.Level.Value or 0
+end
+local function isVip()
+    local gp = LocalPlayer:FindFirstChild("Gamepass")
+    return gp and gp:FindFirstChild("Vip") and gp.Vip.Value == true or false
+end
+local function isInQueue()
+    return LocalPlayer:GetAttribute("InQueue") == true
+end
+
+-- Extract the hero type name from a data.Unit[uuid] entry.
+-- Lobby server uses .id, gameplay server uses .UnitName — accept both.
+local function heroNameOf(info)
+    if type(info) ~= "table" then return nil end
+    if type(info.UnitName) == "string" and info.UnitName ~= "" then return info.UnitName end
+    if type(info.id) == "string" and info.id ~= "" then return info.id end
+    return nil
+end
+
+-- Read remaining stock for a shop item. Different shops store data differently:
+--   CoinsShop / RagnarokEvent → data.<shop>.Stock[item]  (nested)
+--   RaidShop / WitchEvent / TokyoEvent / FateEvent → data.<shop>[item]  (flat)
+-- Returns nil if unknown / unlimited (caller falls back to buying 1).
+local SHOP_STOCK_NESTED = { CoinsShop = true, RagnarokEvent = true }
+local function shopStockRemaining(shopKey, itemName)
+    local data = getClientData()
+    if not (data and type(data[shopKey]) == "table") then return nil end
+    local container
+    if SHOP_STOCK_NESTED[shopKey] then
+        container = data[shopKey].Stock
+    else
+        container = data[shopKey]
+    end
+    if type(container) ~= "table" then return nil end
+    local v = container[itemName]
+    if type(v) == "number" then return v end
+    return nil
+end
+
+-- // 5. ANTI-AFK
+coroutine.wrap(function()
+    local GC = getconnections or get_signal_cons
+    if GC then
+        local ok = pcall(function()
+            for _, v in pairs(GC(LocalPlayer.Idled)) do
+                if v.Disable then v.Disable(v) elseif v.Disconnect then v.Disconnect(v) end
+            end
+        end)
+        if ok then return end
+    end
+    LocalPlayer.Idled:Connect(function()
+        VirtualUser:CaptureController()
+        VirtualUser:ClickButton2(Vector2.new())
+    end)
+end)()
+
+-- // 6. UI LIBRARY
+local MacLib
+local okUI = pcall(function()
+    MacLib = loadstring(game:HttpGet("https://raw.githubusercontent.com/dvorfkar6-lab/uis/refs/heads/main/Mac"))()
+end)
+if not MacLib or not okUI then
+    warn("[ApelHub] Failed to load MacLib")
+    return
+end
+
+local Window = MacLib:Window({
+    Title    = "Anime Reversal | Apel Hub",
+    Subtitle = _AR.IsGameplayServer and "v1.0  ·  GAMEPLAY" or "v1.0  ·  LOBBY",
+    Size     = UDim2.fromOffset(865, 650),
+    DragStyle = 2,
+    Keybind  = Enum.KeyCode.LeftControl,
+    AcrylicBlur = false,
+})
+getgenv()._ARUI = Window
+
+local tabGroup = Window:TabGroup()
+local tabs = {}
+-- Order matters: each :Tab() call adds a button in the tab bar in order.
+tabs.Play     = tabGroup:Tab({ Name = "Auto Join",     Image = "rbxassetid://10734923549" })
+tabs.Summon   = tabGroup:Tab({ Name = "Summon & Units", Image = "rbxassetid://10747372992" })
+tabs.Macros   = tabGroup:Tab({ Name = "Macros",        Image = "rbxassetid://10734898592" })
+tabs.Shops    = tabGroup:Tab({ Name = "Shops",         Image = "rbxassetid://10734950309" })
+tabs.Claim    = tabGroup:Tab({ Name = "Claims",        Image = "rbxassetid://10747373074" })
+tabs.Events   = tabGroup:Tab({ Name = "Events",        Image = "rbxassetid://10734975692" })
+tabs.Codes    = tabGroup:Tab({ Name = "Codes",         Image = "rbxassetid://10734898592" })
+tabs.Teleport = tabGroup:Tab({ Name = "Teleport",      Image = "rbxassetid://6026568198"  })
+tabs.Misc     = tabGroup:Tab({ Name = "Misc",          Image = "rbxassetid://10734932295" })
+tabs.Settings = tabGroup:Tab({ Name = "Settings",      Image = "rbxassetid://10734950309" })
+
+local sec = {
+    SummonL = tabs.Summon:Section({ Side = "Left" }),
+    SummonR = tabs.Summon:Section({ Side = "Right" }),
+
+    -- Units content lives inside the Summon tab (combined view).
+    -- UnitsL/R aliases kept so the existing Units block doesn't need changes.
+    -- They're populated below after the sec table is constructed.
+
+    PlayL   = tabs.Play:Section({ Side = "Left" }),
+    PlayR   = tabs.Play:Section({ Side = "Right" }),
+
+    MacrosL = tabs.Macros:Section({ Side = "Left" }),
+    MacrosR = tabs.Macros:Section({ Side = "Right" }),
+
+    ShopsL  = tabs.Shops:Section({ Side = "Left" }),
+    ShopsR  = tabs.Shops:Section({ Side = "Right" }),
+
+    ClaimL  = tabs.Claim:Section({ Side = "Left" }),
+    ClaimR  = tabs.Claim:Section({ Side = "Right" }),
+
+    EventsL = tabs.Events:Section({ Side = "Left" }),
+    EventsR = tabs.Events:Section({ Side = "Right" }),
+
+    CodesL  = tabs.Codes:Section({ Side = "Left" }),
+    CodesR  = tabs.Codes:Section({ Side = "Right" }),
+
+    TpL     = tabs.Teleport:Section({ Side = "Left" }),
+    TpR     = tabs.Teleport:Section({ Side = "Right" }),
+
+    MiscL   = tabs.Misc:Section({ Side = "Left" }),
+    MiscR   = tabs.Misc:Section({ Side = "Right" }),
+
+    SetL    = tabs.Settings:Section({ Side = "Left" }),
+    SetR    = tabs.Settings:Section({ Side = "Right" }),
+}
+
+-- Units content is appended to the Summon tab's sections.
+sec.UnitsL = sec.SummonL
+sec.UnitsR = sec.SummonR
+
+local function Notify(msg, lifetime)
+    pcall(function()
+        Window:Notify({ Title = "Apel Hub", Description = tostring(msg), Lifetime = lifetime or 3 })
+    end)
+end
+
+-- // 7. WEBHOOK
+local function sendWebhook(title, description, color)
+    if not _AR.WebhookURL or _AR.WebhookURL == "" then return end
+    task.spawn(function()
+        local pingContent = nil
+        if type(_AR.WebhookDiscordUserId) == "string" and _AR.WebhookDiscordUserId ~= "" then
+            pingContent = "<@" .. _AR.WebhookDiscordUserId .. ">"
+        end
+        local payload = HttpService:JSONEncode({
+            username = "Apel Hub · Anime Reversal",
+            content  = pingContent,
+            embeds   = {{
+                title       = title,
+                description = description,
+                color       = color or 15277667,
+                footer      = { text = "Apel Hub • " .. os.date("%Y-%m-%d %H:%M:%S") },
+            }},
+        })
+        local sent = false
+        if _cachedRequest then
+            sent = pcall(function()
+                _cachedRequest({ Url = _AR.WebhookURL, Method = "POST",
+                    Headers = { ["Content-Type"] = "application/json" }, Body = payload })
+            end)
+        end
+        if not sent then
+            pcall(function()
+                HttpService:PostAsync(_AR.WebhookURL, payload, Enum.HttpContentType.ApplicationJson, false)
+            end)
+        end
+    end)
+end
+
+-- Early exit if modules failed
+if not _AR.ModulesLoaded then
+    sec.SetL:Header({ Text = "Module load failed" })
+    sec.SetL:Paragraph({ Header = "Error", Body = tostring(errLoad) })
+    sec.SetL:Button({
+        Name = "Retry (rerun script)",
+        Callback = function() Notify("Rerun the script to retry", 4) end,
+    })
+    return
+end
+
+-- ════════════════════════════════════════════════════════════════
+-- SUMMON TAB
+-- ════════════════════════════════════════════════════════════════
+local _ok_summon, _err_summon = pcall(function()
+    sec.SummonL:Header({ Text = "Summon" })
+
+    sec.SummonL:Dropdown({
+        Name = "Banner",
+        Options = { "Special", "Custom", "Witch" },
+        Default = "Special",
+        Callback = function(v) _AR.SummonBanner = v end,
+    }, "SummonBanner")
+
+    sec.SummonL:Dropdown({
+        Name = "Amount",
+        Options = { "x1", "x10" },
+        Default = "x1",
+        Callback = function(v) _AR.SummonAmount = v == "x10" and 10 or 1 end,
+    }, "SummonAmount")
+
+    sec.SummonL:Slider({
+        Name = "Delay (s)",
+        Default = 0.3, Minimum = 0.1, Maximum = 3, Precision = 1,
+        DisplayMethod = "Value",
+        Callback = function(v) _AR.SummonDelay = v end,
+    }, "SummonDelay")
+
+    sec.SummonL:Divider()
+
+    sec.SummonL:Button({
+        Name = "Summon Once",
+        Callback = function()
+            safe(function()
+                Remotes.Summon.Summon:FireServer(_AR.SummonBanner, _AR.SummonAmount)
+            end)
+        end,
+    })
+
+    sec.SummonL:Toggle({
+        Name = "Auto Summon",
+        Default = false,
+        Callback = function(v) _AR.AutoSummonEnabled = v end,
+    }, "AutoSummon")
+
+    -- Right: pity + stats
+    sec.SummonR:Header({ Text = "Pity (current banner)" })
+    local pityPara = sec.SummonR:Paragraph({ Header = "Pity Status", Body = "Loading..." })
+
+    task.spawn(function()
+        while getgenv()._ARRunning do
+            task.wait(1)
+            local data = getClientData()
+            if data and data.Banner and data.Banner[_AR.SummonBanner] then
+                local b = data.Banner[_AR.SummonBanner]
+                local body = ("Banner: %s\nMythic pulls: %s\nLegend pulls: %s"):format(
+                    _AR.SummonBanner,
+                    tostring(b.MythicPity or 0),
+                    tostring(b.LegendPity or 0))
+                if b.SecretPity then
+                    body = body .. "\nSecret pulls: " .. tostring(b.SecretPity)
+                end
+                pcall(function() pityPara:UpdateBody(body) end)
+            end
+        end
+    end)
+
+    sec.SummonR:Header({ Text = "Currencies" })
+    local currPara = sec.SummonR:Paragraph({ Header = "Wallet", Body = "Loading..." })
+    task.spawn(function()
+        while getgenv()._ARRunning do
+            task.wait(1)
+            local d = getClientData()
+            local dd = d and d.Data or {}
+            local body = string.format(
+                "💎 Gems: %s\n🪙 Coins: %s\n📖 Gospel Pages: %s\n🔥 Black Fire: %s\n" ..
+                "🎟 Ticket: %s  ·  💠 Reroll: %s\nLv %d  ·  Summoned: %d",
+                tostring(dd.Gems or 0),
+                tostring(dd.Coins or 0),
+                tostring(dd["Gospel Pages"] or 0),
+                tostring(dd["Black Fire"] or 0),
+                tostring(dd.Ticket or 0),
+                tostring(dd.RerollCrystal or 0),
+                tonumber(dd.Level) or 0,
+                tonumber(dd.UnitSummoned) or 0
+            )
+            pcall(function() currPara:UpdateBody(body) end)
+        end
+    end)
+
+    -- Main loop
+    task.spawn(function()
+        while getgenv()._ARRunning do
+            task.wait(_AR.SummonDelay)
+            if _AR.AutoSummonEnabled and _AR.ModulesLoaded then
+                safe(function()
+                    Remotes.Summon.Summon:FireServer(_AR.SummonBanner, _AR.SummonAmount)
+                end)
+            end
+        end
+    end)
+
+    -- Webhook listener — watch for secrets/mythics via UnitAddedRemote
+    local rarityColors = {
+        Secret    = 16766720,   -- gold
+        Mythic    = 10181046,   -- purple
+        Legend    = 16753920,   -- orange
+        Epic      = 10181046,
+    }
+    local unitAdded = Remotes.Unit:FindFirstChild("UnitAddedRemote")
+    if unitAdded then
+        local conn = unitAdded.OnClientEvent:Connect(function(list)
+            if type(list) ~= "table" then return end
+            for _, pair in ipairs(list) do
+                local uuid = pair[1]
+                local info = pair[2]
+                local hero = heroNameOf(info)
+                if hero then
+                    local cfg = nil
+                    pcall(function()
+                        cfg = UnitModule:GetUnitDatabase(hero)
+                    end)
+                    local rarity = (cfg and cfg.Rarity) or "?"
+                    local shiny  = info.Shiny == true
+                    if rarity == "Secret" and _AR.WebhookOnSecret then
+                        sendWebhook("SECRET DROP",
+                            ("**Unit:** %s%s\n**Banner:** %s\n**Player:** %s"):format(
+                                hero, shiny and "  ⭐ SHINY" or "",
+                                _AR.SummonBanner, LocalPlayer.Name),
+                            rarityColors.Secret)
+                    elseif rarity == "Mythic" and _AR.WebhookOnMythic then
+                        sendWebhook("MYTHIC DROP",
+                            ("**Unit:** %s%s\n**Banner:** %s\n**Player:** %s"):format(
+                                hero, shiny and "  ⭐ SHINY" or "",
+                                _AR.SummonBanner, LocalPlayer.Name),
+                            rarityColors.Mythic)
+                    end
+                end
+            end
+        end)
+        table.insert(_cleanupConns, conn)
+    end
+end)
+if not _ok_summon then warn("[ApelHub] SUMMON tab failed: " .. tostring(_err_summon)) end
+
+-- ════════════════════════════════════════════════════════════════
+-- UNITS TAB (Auto Sell, Auto Feed, Utility)
+-- ════════════════════════════════════════════════════════════════
+local _ok_units, _err_units = pcall(function()
+    sec.UnitsL:Divider()
+    sec.UnitsL:Header({ Text = "Auto Sell — destructive!" })
+    sec.UnitsL:Paragraph({
+        Header = "⚠ Warning — reads carefully",
+        Body = "Auto Sell PERMANENTLY DELETES units from your inventory "
+            .. "for in-game currency. Action cannot be undone.\n\n"
+            .. "• Pick rarities to sell below (empty = nothing sold)\n"
+            .. "• 'Keep' toggles protect Shiny / Locked / Equipped units\n"
+            .. "• Double-check selection before toggling ON\n"
+            .. "• Runs every ~2.5 seconds while enabled",
+    })
+
+    local rarityOptions = { "Rare", "Epic", "Legend", "Mythic" }
+    sec.UnitsL:Dropdown({
+        Name = "Sell Rarities (selected ones get deleted)",
+        Multi = true,
+        Options = rarityOptions,
+        Default = {},
+        Callback = function(selected)
+            _AR.AutoSellRarities = {}
+            for r, on in pairs(selected) do
+                if on then _AR.AutoSellRarities[r] = true end
+            end
+        end,
+    }, "SellRarities")
+
+    sec.UnitsL:Toggle({
+        Name = "Keep Shiny ⭐",
+        Default = true,
+        Callback = function(v) _AR.AutoSellKeepShiny = v end,
+    }, "SellKeepShiny")
+    sec.UnitsL:Toggle({
+        Name = "Keep Locked 🔒",
+        Default = true,
+        Callback = function(v) _AR.AutoSellKeepLocked = v end,
+    }, "SellKeepLocked")
+    sec.UnitsL:Toggle({
+        Name = "Keep Equipped (team slots)",
+        Default = true,
+        Callback = function(v) _AR.AutoSellKeepEquipped = v end,
+    }, "SellKeepEquipped")
+
+    sec.UnitsL:Toggle({
+        Name = "Auto Sell (destroys units matching filter)",
+        Default = false,
+        Callback = function(v)
+            _AR.AutoSellEnabled = v
+            if v then
+                local rarityList = {}
+                for r in pairs(_AR.AutoSellRarities) do table.insert(rarityList, r) end
+                if #rarityList == 0 then
+                    Notify("⚠ No rarities selected — nothing will be sold", 4)
+                else
+                    Notify("⚠ Auto Sell ACTIVE — deleting " .. table.concat(rarityList, ", "), 5)
+                end
+            end
+        end,
+    }, "AutoSell")
+
+    sec.UnitsL:Button({
+        Name = "Sell Now (one-shot)",
+        Callback = function() _AR._sellOnce = true end,
+    })
+
+    -- Auto sell loop
+    -- Rarity resolution: data.Unit[uuid] does NOT contain a Rarity field in
+    -- this game's schema, so we must look it up via UnitModule.GetUnitDatabase.
+    -- If that fails (module not loaded / unknown hero), we SKIP the unit to
+    -- avoid accidentally deleting something valuable.
+    local function collectSellBatch()
+        local data = getClientData()
+        if not data or not data.Unit then return {} end
+        local equippedTeam = data.Team and data.Team[data.Team.TeamEquipping] or {}
+        local equippedLookup = {}
+        if type(equippedTeam) == "table" then
+            for _, u in pairs(equippedTeam) do equippedLookup[u] = true end
+        end
+        local batch = {}
+        local scanned, unknownRarity = 0, 0
+        for uuid, info in pairs(data.Unit) do
+            scanned = scanned + 1
+            local hero = heroNameOf(info)
+            if hero then
+                local cfg = nil
+                pcall(function() cfg = UnitModule:GetUnitDatabase(hero) end)
+                local rarity = cfg and cfg.Rarity
+                if not rarity then
+                    unknownRarity = unknownRarity + 1
+                else
+                    local ok = _AR.AutoSellRarities[rarity] == true
+                    if ok and _AR.AutoSellKeepShiny     and info.Shiny  == true then ok = false end
+                    if ok and _AR.AutoSellKeepLocked    and info.Lock   == true then ok = false end
+                    if ok and _AR.AutoSellKeepEquipped  and equippedLookup[uuid]  then ok = false end
+                    if ok then table.insert(batch, uuid) end
+                end
+            end
+        end
+        dbg(("[sell] scanned=%d unknown_rarity=%d selected=%d"):format(
+            scanned, unknownRarity, #batch))
+        return batch
+    end
+
+    task.spawn(function()
+        while getgenv()._ARRunning do
+            task.wait(2.5)
+            if (_AR.AutoSellEnabled or _AR._sellOnce) and _AR.ModulesLoaded then
+                _AR._sellOnce = false
+                local batch = collectSellBatch()
+                if #batch > 0 then
+                    dbg("Auto Sell: selling " .. #batch)
+                    local CHUNK = 64
+                    for i = 1, #batch, CHUNK do
+                        local slice = {}
+                        for j = i, math.min(i + CHUNK - 1, #batch) do
+                            table.insert(slice, batch[j])
+                        end
+                        safe(function() Remotes.Unit.Sell:FireServer(slice) end)
+                        task.wait(0.25)
+                    end
+                    Notify("Sold " .. #batch .. " unit(s)", 3)
+                end
+            end
+        end
+    end)
+
+    -- Auto Feed
+    sec.UnitsR:Divider()
+    sec.UnitsR:Header({ Text = "Auto Feed" })
+
+    local unitOptionsMap = {} -- label -> uuid
+
+    local feedUnitDD = sec.UnitsR:Dropdown({
+        Name = "Target Unit",
+        Options = { "None" },
+        Default = "None",
+        Callback = function(v)
+            _AR.AutoFeedTargetUuid = unitOptionsMap[v]
+        end,
+    }, "FeedUnit")
+
+    sec.UnitsR:Button({
+        Name = "Refresh unit list",
+        Callback = function()
+            local data = getClientData()
+            unitOptionsMap = {}
+            local list = { "None" }
+            if data and data.Unit then
+                local items = {}
+                for uuid, info in pairs(data.Unit) do
+                    local hero = heroNameOf(info)
+                    if hero then
+                        local cfg = nil
+                        pcall(function() cfg = UnitModule:GetUnitDatabase(hero) end)
+                        table.insert(items, {
+                            uuid = uuid, id = hero,
+                            rarity = (cfg and cfg.Rarity) or "?",
+                            level = info.Level or 1,
+                            shiny = info.Shiny == true,
+                        })
+                    end
+                end
+                table.sort(items, function(a, b)
+                    if a.shiny ~= b.shiny then return a.shiny end
+                    return a.level > b.level
+                end)
+                for i = 1, math.min(#items, 150) do
+                    local it = items[i]
+                    local label = string.format("%s%s [%s] Lv%d · %s",
+                        it.id, it.shiny and " ⭐" or "", it.rarity, it.level, it.uuid:sub(1, 6))
+                    table.insert(list, label)
+                    unitOptionsMap[label] = it.uuid
+                end
+            end
+            pcall(function() feedUnitDD:ClearOptions() end)
+            pcall(function() feedUnitDD:InsertOptions(list) end)
+            Notify("Unit list refreshed (" .. (#list - 1) .. ")", 2)
+        end,
+    })
+
+    local FOODS = { "Green Bean", "Ninja Ramen", "Spirit Dango", "Navy Bento", "Energy Can" }
+    sec.UnitsR:Dropdown({
+        Name = "Foods to use",
+        Multi = true,
+        Options = FOODS,
+        Default = {},
+        Callback = function(selected)
+            _AR.AutoFeedFoods = {}
+            for f, on in pairs(selected) do
+                if on then _AR.AutoFeedFoods[f] = true end
+            end
+        end,
+    }, "FeedFoods")
+
+    sec.UnitsR:Toggle({
+        Name = "Auto Feed",
+        Default = false,
+        Callback = function(v) _AR.AutoFeedEnabled = v end,
+    }, "AutoFeed")
+
+    sec.UnitsR:Button({
+        Name = "Feed Now",
+        Callback = function() _AR._feedOnce = true end,
+    })
+
+    task.spawn(function()
+        while getgenv()._ARRunning do
+            task.wait(3)
+            if (_AR.AutoFeedEnabled or _AR._feedOnce) and _AR.ModulesLoaded then
+                _AR._feedOnce = false
+                local uuid = _AR.AutoFeedTargetUuid
+                local data = getClientData()
+                if uuid and data and data.Item then
+                    local foodMap = {}
+                    for food, on in pairs(_AR.AutoFeedFoods) do
+                        if on then
+                            local owned = (type(data.Item[food]) == "number") and data.Item[food] or 0
+                            if owned > 0 then foodMap[food] = owned end
+                        end
+                    end
+                    if next(foodMap) then
+                        safe(function() Remotes.Unit.Feed:FireServer(uuid, foodMap) end)
+                    end
+                end
+            end
+        end
+    end)
+
+    sec.UnitsR:Divider()
+    sec.UnitsR:Header({ Text = "Utility" })
+    sec.UnitsR:Button({
+        Name = "Unequip All",
+        Callback = function()
+            safe(function() Remotes.Unit.UnEquipAll:FireServer() end)
+            Notify("Unequipped all")
+        end,
+    })
+    sec.UnitsR:Button({
+        Name = "Buy Extra Storage (+25 slots, costs Gems)",
+        Callback = function()
+            safe(function() Remotes.Unit.BuyExtraStorage:FireServer() end)
+        end,
+    })
+    local storagePara = sec.UnitsR:Paragraph({ Header = "Storage", Body = "…" })
+    task.spawn(function()
+        while getgenv()._ARRunning do
+            task.wait(3)
+            local d = getClientData()
+            if d and d.Data and d.Unit then
+                local owned = 0
+                for _ in pairs(d.Unit) do owned = owned + 1 end
+                pcall(function()
+                    storagePara:UpdateBody(("Used: %d / %d  (base %d + extra %d)"):format(
+                        owned,
+                        (d.Data.MaxUnit or 0),
+                        (d.Data.MaxUnit or 0) - (d.Data.ExtraUnit or 0),
+                        d.Data.ExtraUnit or 0))
+                end)
+            end
+        end
+    end)
+end)
+if not _ok_units then warn("[ApelHub] UNITS tab failed: " .. tostring(_err_units)) end
+
+-- ════════════════════════════════════════════════════════════════
+-- ════════════════════════════════════════════════════════════════
+-- AUTO JOIN TAB
+-- ════════════════════════════════════════════════════════════════
+local _ok_autojoin, _err_autojoin = pcall(function()
+    -- Special modes that use dedicated remotes (not ConfirmPlay).
+    -- Listed in Mode dropdown prefixed with "★" so user picks them alongside
+    -- regular modes; Join Now / AutoStart then fires the right remote.
+    local SPECIAL_MODES = {
+        { label = "★ Challenge",        doorKind = "Challenge", fire = function() Remotes.Play.JoinChallenge:FireServer("Challenge") end },
+        { label = "★ Daily Challenge",  doorKind = "Challenge", fire = function() Remotes.Play.JoinChallenge:FireServer("DailyChallenge") end },
+        { label = "★ Legend Stage",     doorKind = "Story",     fire = function() Remotes.Play.JoinChallenge:FireServer("LegendStage") end },
+        { label = "★ Tournament",       doorKind = "Story",     fire = function() Remotes.Play.StartPlay:FireServer("Tournament") end },
+        { label = "★ FireFist Event",   doorKind = "Story",     fire = function() Remotes.Play.PlayFireFist:FireServer() end },
+        { label = "★ Thar (Ragnarok)",  doorKind = "Story",     fire = function() Remotes.Play.PlayThar:FireServer() end },
+        { label = "★ Witch Event",      doorKind = "Story",     fire = function() Remotes.Play.WitchEvent:FireServer() end },
+        { label = "★ Gilgamash (Fate)", doorKind = "Story",     fire = function() Remotes.Play.GilgamashCastle:FireServer() end },
+        { label = "★ Kuromi Event",     doorKind = "Story",     fire = function() Remotes.Play.PlayKuromi:FireServer() end },
+    }
+    local SPECIAL_BY_LABEL = {}
+    for _, s in ipairs(SPECIAL_MODES) do SPECIAL_BY_LABEL[s.label] = s end
+
+    -- Build mode list: StageData modes first, then special ones
+    local MODES = {}
+    for modeName in pairs(StageData) do table.insert(MODES, modeName) end
+    table.sort(MODES)
+    for _, s in ipairs(SPECIAL_MODES) do table.insert(MODES, s.label) end
+    if #MODES == 0 then MODES = { "None" } end
+
+    local function isSpecialMode(label) return SPECIAL_BY_LABEL[label] ~= nil end
+
+    local function getStagesForMode(mode)
+        if isSpecialMode(mode) then return { "—" } end
+        local out = {}
+        local m = StageData[mode]
+        if type(m) == "table" then
+            for k, v in pairs(m) do
+                if type(v) == "table" then table.insert(out, k) end
+            end
+        end
+        table.sort(out)
+        if #out == 0 then out = { "None" } end
+        return out
+    end
+
+    local function getChaptersForStage(mode, stage)
+        if isSpecialMode(mode) then return { "—" } end
+        local out = {}
+        local m = StageData[mode]
+        if m and m[stage] and type(m[stage]) == "table" then
+            local n = m[stage][1] or 5
+            for i = 1, tonumber(n) or 5 do
+                table.insert(out, "Chapter" .. i)
+            end
+        end
+        if #out == 0 then out = { "Chapter1" } end
+        return out
+    end
+
+    -- Default selection
+    local defaultMode = (type(StageData.Story) == "table" and "Story") or MODES[1]
+    local stageOpts    = getStagesForMode(defaultMode)
+    local chapterOpts  = getChaptersForStage(defaultMode, stageOpts[1])
+    _AR.SelectedMode       = defaultMode
+    _AR.SelectedStage      = stageOpts[1]
+    _AR.SelectedChapter    = chapterOpts[1]
+    _AR.SelectedDifficulty = "Normal"
+    _AR.FriendsOnly        = false
+
+    -- ─── Door teleport helpers ─────────────────────────────────
+    -- These indices match the lobby workspace layout. If the game moves
+    -- things around we fall back to scanning by Model name.
+    local DOORS = {
+        Story     = 143,  -- Story / LegendStage door
+        Challenge = 22,   -- Challenge / DailyChallenge door
+        Raid      = 2,    -- Raid door
+    }
+
+    local function getDoorCFrame(kind)
+        local lobby = Workspace:FindFirstChild("Map")
+        lobby = lobby and lobby:FindFirstChild("Lobby")
+        if not lobby then return nil end
+        local idx = DOORS[kind]
+        local children = lobby:GetChildren()
+        local candidate = children[idx]
+        -- Resolve candidate.Model.Model to a positional part
+        local function pickCFrame(root)
+            if not root then return nil end
+            local m1 = root:FindFirstChild("Model")
+            if not m1 then return nil end
+            local m2 = m1:FindFirstChild("Model")
+            local part = (m2 and m2.PrimaryPart) or (m1 and m1.PrimaryPart)
+            if not part then
+                -- find any BasePart descendant
+                for _, d in ipairs((m2 or m1):GetDescendants()) do
+                    if d:IsA("BasePart") then part = d; break end
+                end
+            end
+            return part and part.CFrame
+        end
+        return pickCFrame(candidate)
+    end
+
+    local function teleportToDoor(kind)
+        local char = LocalPlayer.Character
+        local hrp  = char and char:FindFirstChild("HumanoidRootPart")
+        if not hrp then
+            Notify("Character not loaded", 3)
+            return false
+        end
+        local cf = getDoorCFrame(kind)
+        if not cf then
+            Notify("Door not found: " .. kind, 3)
+            return false
+        end
+        -- Teleport with small Y offset so we don't clip inside the door
+        hrp.CFrame = cf + Vector3.new(0, 3, 0)
+        return true
+    end
+
+    -- Determine which door to use for the currently selected mode
+    local function doorKindForMode(mode)
+        local spec = SPECIAL_BY_LABEL[mode]
+        if spec and spec.doorKind then return spec.doorKind end
+        if mode == "Raid" then return "Raid" end
+        return "Story"  -- Story, LegendStage, and default
+    end
+    -- Normal flow: ConfirmPlay → creates a portal in workspace → StartPlay
+    -- begins the match. Auto Start toggle does both.
+    local function fireConfirmPlay()
+        local p = Remotes:FindFirstChild("Play")
+        local cp = p and p:FindFirstChild("ConfirmPlay")
+        if not cp then
+            Notify("Play.ConfirmPlay missing (need lobby server)", 3)
+            return false
+        end
+        local ok, err = pcall(function()
+            cp:FireServer(
+                _AR.SelectedStage,
+                _AR.SelectedChapter,
+                _AR.SelectedDifficulty,
+                _AR.FriendsOnly,
+                _AR.SelectedMode
+            )
+        end)
+        if not ok then
+            Notify("ConfirmPlay error: " .. tostring(err), 4)
+            return false
+        end
+        return true
+    end
+
+    local function fireStartPlay()
+        local p = Remotes:FindFirstChild("Play")
+        local sp = p and p:FindFirstChild("StartPlay")
+        if not sp then return false end
+        local ok = pcall(function() sp:FireServer() end)
+        return ok
+    end
+
+    -- Join-only (creates portal / joins challenge). No StartPlay.
+    -- Teleports to the correct door first so the game's UI / tile spawn.
+    local function performJoin()
+        local mode = _AR.SelectedMode
+        teleportToDoor(doorKindForMode(mode))
+        task.wait(0.3)
+        local spec = SPECIAL_BY_LABEL[mode]
+        if spec then
+            local ok, err = pcall(spec.fire)
+            if ok then
+                Notify("Joined: " .. mode:gsub("^★ ", ""), 3)
+            else
+                Notify("Failed: " .. tostring(err), 4)
+            end
+            return
+        end
+        if fireConfirmPlay() then
+            Notify(("Portal created: %s · %s · %s · %s"):format(
+                mode, tostring(_AR.SelectedStage),
+                tostring(_AR.SelectedChapter),
+                tostring(_AR.SelectedDifficulty)), 3)
+        end
+    end
+
+    -- Full start flow: teleport to door → ConfirmPlay → StartPlay
+    local function performJoinAndStart()
+        local mode = _AR.SelectedMode
+        teleportToDoor(doorKindForMode(mode))
+        task.wait(0.3)
+        local spec = SPECIAL_BY_LABEL[mode]
+        if spec then
+            pcall(spec.fire)
+            Notify("Starting: " .. mode:gsub("^★ ", ""), 3)
+            return
+        end
+        if fireConfirmPlay() then
+            Notify(("Starting: %s · %s · %s · %s"):format(
+                mode, tostring(_AR.SelectedStage),
+                tostring(_AR.SelectedChapter),
+                tostring(_AR.SelectedDifficulty)), 3)
+            task.delay(0.6, function()
+                fireStartPlay()
+            end)
+        end
+    end
+
+    -- ═══ LEFT — main selection + toggles ═══
+    sec.PlayL:Header({ Text = "Match Selection" })
+
+    local modeDD, stageDD, chapterDD, diffDD
+
+    modeDD = sec.PlayL:Dropdown({
+        Name = "Mode",
+        Options = MODES,
+        Default = defaultMode,
+        Callback = function(v)
+            _AR.SelectedMode = v
+            local stages = getStagesForMode(v)
+            pcall(function() stageDD:ClearOptions() end)
+            pcall(function() stageDD:InsertOptions(stages) end)
+            pcall(function() stageDD:UpdateSelection(stages[1]) end)
+            _AR.SelectedStage = stages[1]
+            local chaps = getChaptersForStage(v, stages[1])
+            pcall(function() chapterDD:ClearOptions() end)
+            pcall(function() chapterDD:InsertOptions(chaps) end)
+            pcall(function() chapterDD:UpdateSelection(chaps[1]) end)
+            _AR.SelectedChapter = chaps[1]
+        end,
+    }, "PlayMode")
+
+    stageDD = sec.PlayL:Dropdown({
+        Name = "Stage",
+        Options = stageOpts,
+        Default = stageOpts[1],
+        Callback = function(v)
+            _AR.SelectedStage = v
+            local chaps = getChaptersForStage(_AR.SelectedMode, v)
+            pcall(function() chapterDD:ClearOptions() end)
+            pcall(function() chapterDD:InsertOptions(chaps) end)
+            pcall(function() chapterDD:UpdateSelection(chaps[1]) end)
+            _AR.SelectedChapter = chaps[1]
+        end,
+    }, "PlayStage")
+
+    chapterDD = sec.PlayL:Dropdown({
+        Name = "Chapter",
+        Options = chapterOpts,
+        Default = chapterOpts[1],
+        Callback = function(v) _AR.SelectedChapter = v end,
+    }, "PlayChapter")
+
+    diffDD = sec.PlayL:Dropdown({
+        Name = "Difficulty",
+        Options = { "Normal", "Hard", "Nightmare" },
+        Default = "Normal",
+        Callback = function(v) _AR.SelectedDifficulty = v end,
+    }, "PlayDifficulty")
+
+    sec.PlayL:Toggle({
+        Name = "Friends Only",
+        Default = false,
+        Callback = function(v) _AR.FriendsOnly = v end,
+    }, "FriendsOnly")
+
+    sec.PlayL:Divider()
+    sec.PlayL:Header({ Text = "Auto" })
+
+    sec.PlayL:Toggle({
+        Name = "AutoStart",
+        Default = false,
+        Callback = function(v)
+            _AR.AutoQueueEnabled = v
+            if v then Notify("AutoStart ON — " .. _AR.SelectedMode, 2) end
+        end,
+    }, "AutoStart")
+
+    sec.PlayL:Button({
+        Name = "Start Match Now",
+        Callback = performJoinAndStart,
+    })
+
+    -- On gameplay server: add Return/Replay/PlayNext buttons (match-end flow)
+    if _AR.IsGameplayServer then
+        sec.PlayL:Divider()
+        sec.PlayL:Header({ Text = "Match controls" })
+        sec.PlayL:Button({
+            Name = "▶ Replay match",
+            Callback = function()
+                safe(function()
+                    local r = Remotes:FindFirstChild("Replay")
+                    if r then r:FireServer() end
+                end)
+            end,
+        })
+        sec.PlayL:Button({
+            Name = "⟳ Play Next (sequel map)",
+            Callback = function()
+                safe(function()
+                    local r = Remotes:FindFirstChild("PlayNext")
+                    if r then r:FireServer() end
+                end)
+            end,
+        })
+        sec.PlayL:Button({
+            Name = "← Return to Lobby",
+            Callback = function()
+                safe(function()
+                    local r = Remotes:FindFirstChild("ReturnToLobby")
+                    if r then r:FireServer() end
+                end)
+            end,
+        })
+    end
+
+    -- ═══ RIGHT — live status ═══
+    sec.PlayR:Header({ Text = "Status" })
+    local statusPara = sec.PlayR:Paragraph({ Header = "Live", Body = "Idle" })
+    task.spawn(function()
+        while getgenv()._ARRunning do
+            task.wait(1)
+            local body
+            if _AR.IsGameplayServer then
+                -- In a match: show stage info from workspace
+                local pf = Workspace:FindFirstChild("PlayFolder")
+                local sf = pf and pf:FindFirstChild("StageFolder")
+                local stage = sf and sf:FindFirstChild("Stage")
+                local chapter = sf and sf:FindFirstChild("Chapter")
+                local mode = sf and sf:FindFirstChild("Mode")
+                local diff = sf and sf:FindFirstChild("Difficult")
+                body = ("● IN MATCH\n%s · %s\n%s · %s\n\nSaved selection:\n%s · %s · %s · %s"):format(
+                    (stage and stage.Value) or "?",
+                    (chapter and chapter.Value) or "?",
+                    (mode and mode.Value) or "?",
+                    (diff and diff.Value) or "?",
+                    tostring(_AR.SelectedMode),
+                    tostring(_AR.SelectedStage),
+                    tostring(_AR.SelectedChapter),
+                    tostring(_AR.SelectedDifficulty))
+            elseif isInQueue() then
+                body = ("● IN QUEUE\n%s · %s\n%s · %s"):format(
+                    _AR.SelectedMode, tostring(_AR.SelectedStage),
+                    tostring(_AR.SelectedChapter), tostring(_AR.SelectedDifficulty))
+            elseif _AR.AutoQueueEnabled then
+                body = ("AutoStart ON · waiting\nNext join: %s"):format(_AR.SelectedMode)
+            else
+                body = "Idle"
+            end
+            pcall(function() statusPara:UpdateBody(body) end)
+        end
+    end)
+
+    if _AR.IsGameplayServer then
+        sec.PlayR:Paragraph({
+            Header = "Gameplay server",
+            Body = "Queue / Portal / AutoStart don't apply here. Saved selection "
+                .. "will be used on lobby when you're back. Use Match controls "
+                .. "above to Replay / PlayNext / Return.",
+        })
+    else
+        sec.PlayR:Paragraph({
+            Header = "Tip",
+            Body = "Modes prefixed with ★ are event / one-shot plays (Tournament, Fate, "
+                .. "Challenges, etc.). Stage/Chapter/Difficulty only apply to normal modes.",
+        })
+    end
+
+    -- ═══ AutoStart loop ═══
+    -- Checks every second: if not already in a match, runs the full flow
+    -- (teleport to door → ConfirmPlay → StartPlay). Cooldown 11s prevents
+    -- rapid-fire spam.
+    _AR._lastQueueAt = _AR._lastQueueAt or 0
+    task.spawn(function()
+        while getgenv()._ARRunning do
+            task.wait(1)
+            if _AR.AutoQueueEnabled and _AR.ModulesLoaded then
+                if not isInQueue() and (tick() - _AR._lastQueueAt) > 11 then
+                    _AR._lastQueueAt = tick()
+                    performJoinAndStart()
+                end
+            end
+        end
+    end)
+end)
+if not _ok_autojoin then warn("[ApelHub] AUTOJOIN tab setup failed: " .. tostring(_err_autojoin)) print("[ApelHub] AUTOJOIN:", _err_autojoin) end
+
+-- ════════════════════════════════════════════════════════════════
+-- MACROS TAB (Record/Playback unit placement & upgrades)
+-- ════════════════════════════════════════════════════════════════
+local _ok_macros, _err_macros = pcall(function()
+    -- ─── CFrame serialization (12 floats) ─────────────────────────
+    local function cfToArr(cf)
+        local c = { cf:GetComponents() }
+        local out = {}
+        for i = 1, #c do out[i] = math.floor(c[i] * 10000 + 0.5) / 10000 end
+        return out
+    end
+    local function arrToCf(a)
+        if type(a) ~= "table" or #a < 12 then return CFrame.new() end
+        return CFrame.new(a[1], a[2], a[3], a[4], a[5], a[6],
+                          a[7], a[8], a[9], a[10], a[11], a[12])
+    end
+
+    -- ─── Team slot helpers ────────────────────────────────────────
+    -- Cache the Slots folder reference — avoid expensive GetDescendants()
+    -- on every placement event during recording.
+    local _cachedSlots = nil
+    local function findTeamSlotsFolder()
+        if _cachedSlots and _cachedSlots.Parent then return _cachedSlots end
+        local pg = LocalPlayer:FindFirstChild("PlayerGui")
+        if not pg then return nil end
+        -- Direct path first (fast)
+        local direct = pg:FindFirstChild("Main")
+        local bottom = direct and direct:FindFirstChild("BottomMain")
+        local unitTeam = bottom and bottom:FindFirstChild("UnitTeam")
+        local slots = unitTeam and unitTeam:FindFirstChild("Slots")
+        if slots then _cachedSlots = slots; return slots end
+        -- Fallback: recursive scan
+        for _, d in ipairs(pg:GetDescendants()) do
+            if d.Name == "Slots" and d.Parent and d.Parent.Name == "UnitTeam" then
+                _cachedSlots = d
+                return d
+            end
+        end
+        return nil
+    end
+
+    local function getTeamSlotButtons()
+        local slots = findTeamSlotsFolder()
+        if not slots then return {} end
+        local out = {}
+        for i = 1, 6 do
+            local btn = slots:FindFirstChild("Unit" .. i)
+            if btn then out[i] = btn end
+        end
+        return out
+    end
+
+    -- Resolve UUID → UnitName (hero type) by scanning team slot attributes
+    local function uuidToUnitName(uuid)
+        if not uuid or uuid == "" then return nil end
+        for _, btn in ipairs(getTeamSlotButtons()) do
+            if btn:GetAttribute("UnitRealName") == uuid then
+                return btn:GetAttribute("UnitName"), btn
+            end
+        end
+        return nil
+    end
+
+    -- Resolve UnitName (hero type) → UUID from current team (for playback)
+    local function unitNameToUuid(unitName)
+        if not unitName or unitName == "" then return nil end
+        for _, btn in ipairs(getTeamSlotButtons()) do
+            if btn:GetAttribute("UnitName") == unitName then
+                return btn:GetAttribute("UnitRealName")
+            end
+        end
+        return nil
+    end
+
+    local function getOwnPlayFolder()
+        local pf = Workspace:FindFirstChild("PlayFolder")
+        if not pf then return nil end
+        return pf:FindFirstChild(LocalPlayer.Name)
+    end
+
+    -- ─── File I/O ─────────────────────────────────────────────────
+    local function macroPath(name)
+        return MacroFolder .. "/" .. name .. ".json"
+    end
+
+    local function listMacros()
+        local out = {}
+        if not isfolder(MacroFolder) then return out end
+        local ok, files = pcall(listfiles, MacroFolder)
+        if not ok or type(files) ~= "table" then return out end
+        for _, f in ipairs(files) do
+            local base = f:match("([^/\\]+)%.json$")
+            if base then table.insert(out, base) end
+        end
+        table.sort(out)
+        return out
+    end
+
+    local function saveMacro(name, macro)
+        if not name or name == "" then return false, "empty name" end
+        local path = macroPath(name)
+        local ok, encoded = pcall(HttpService.JSONEncode, HttpService, macro)
+        if not ok then return false, tostring(encoded) end
+        local wrote, err = pcall(writefile, path, encoded)
+        if not wrote then return false, tostring(err) end
+        return true
+    end
+
+    local function loadMacro(name)
+        local path = macroPath(name)
+        if not isfile(path) then return nil, "not found" end
+        local ok, text = pcall(readfile, path)
+        if not ok then return nil, tostring(text) end
+        local okD, decoded = pcall(HttpService.JSONDecode, HttpService, text)
+        if not okD then return nil, tostring(decoded) end
+        return decoded
+    end
+
+    local function deleteMacro(name)
+        local path = macroPath(name)
+        if isfile(path) then pcall(delfile, path) end
+    end
+
+    -- ─── Record hook (install ONCE per Roblox session) ───────────
+    -- Stored in getgenv() so that re-running the script doesn't chain hooks.
+    --
+    -- KILL SWITCH: the hook checks getgenv()._ARHookActive FIRST. While this
+    -- flag is false (default), the hook returns instantly without doing any
+    -- table lookups — this is critical because the game may issue tens of
+    -- thousands of namecalls per second during unit placement, and even an
+    -- O(1) table lookup can stack up to game-crashing overhead.
+    --
+    -- The flag is flipped to true only when the user enables Record, starts
+    -- a Playback, or enables Place Anywhere. It flips back to false when all
+    -- three are inactive.
+    do
+        -- Build a fast { [Instance] = "Name" } lookup table.
+        local targetRemotes = getgenv()._ARTargetRemotes or {}
+        for k in pairs(targetRemotes) do targetRemotes[k] = nil end
+        for _, rname in ipairs({
+            "CreateUnits", "Upgrades", "SellUnit", "ChangeOrder",
+            "ActiveSkill", "SkipWave", "UseItem",
+        }) do
+            local r = Remotes:FindFirstChild(rname)
+            if r then targetRemotes[r] = rname end
+        end
+        getgenv()._ARTargetRemotes = targetRemotes
+        -- Default OFF. Callers enable only when they need hook behavior.
+        if getgenv()._ARHookActive == nil then
+            getgenv()._ARHookActive = false
+        end
+
+        -- V4 sentinel: adds kill-switch. Replaces V3 hook if present.
+        if not getgenv()._ARNamecallHookV4 and hookmetamethod then
+            getgenv()._ARNamecallHookV4 = true
+            local TARGETS = targetRemotes
+            local oldNamecall
+            oldNamecall = hookmetamethod(game, "__namecall", function(self, ...)
+                -- SUPER-FAST PATH: kill switch. One upvalue check, done.
+                -- Stays here 99%+ of the time when hub features are idle.
+                if not getgenv()._ARHookActive then
+                    return oldNamecall(self, ...)
+                end
+                -- FAST PATH: single table lookup by Instance reference.
+                local remoteName = TARGETS[self]
+                if not remoteName then
+                    return oldNamecall(self, ...)
+                end
+                if getnamecallmethod() ~= "FireServer" then
+                    return oldNamecall(self, ...)
+                end
+
+                -- SLOW PATH: this is one of our target remotes.
+                local isExternal = not checkcaller()
+
+                if isExternal then
+                    local fn = getgenv()._ARMacroRecordFn
+                    if fn then pcall(fn, self, ...) end
+                end
+
+                if remoteName == "CreateUnits" then
+                    getgenv()._ARLastCreateUnitsFire = tick()
+                    if isExternal and getgenv()._ARPlaceAnywhereEnabled then
+                        local cb = getgenv()._ARMouseCFFn
+                        if cb then
+                            local ok, newCF = pcall(cb)
+                            if ok and typeof(newCF) == "CFrame" then
+                                local args = { ... }
+                                args[2] = newCF
+                                return oldNamecall(self, unpack(args))
+                            end
+                        end
+                    end
+                end
+
+                return oldNamecall(self, ...)
+            end)
+        end
+    end
+
+    -- Helper to recompute whether the hook should be active. Called whenever
+    -- Record / Playback / PlaceAnywhere toggles change.
+    local function refreshHookActive()
+        local active = _AR.MacroRecording
+                    or _AR.MacroPlaying
+                    or _AR.PlaceAnywhereEnabled
+        getgenv()._ARHookActive = active and true or false
+        dbg(("[hook] active=%s (rec=%s play=%s pa=%s)"):format(
+            tostring(getgenv()._ARHookActive),
+            tostring(_AR.MacroRecording),
+            tostring(_AR.MacroPlaying),
+            tostring(_AR.PlaceAnywhereEnabled)))
+    end
+    _AR._refreshHookActive = refreshHookActive
+
+    -- Actual recording dispatcher (replaced on each script reload)
+    local function recordDispatch(remote, ...)
+        if not _AR.MacroRecording then return end
+        if not _AR.MacroT0 or _AR.MacroT0 == 0 then return end
+        local args = { ... }
+        local t = tick() - _AR.MacroT0
+        local name = remote.Name
+
+        if name == "CreateUnits" then
+            -- args[1] = UnitRealName (uuid), args[2] = CFrame
+            local uuid = args[1]
+            local cf = args[2]
+            if typeof(cf) ~= "CFrame" then return end
+            _AR.MacroPlaceCounter = _AR.MacroPlaceCounter + 1
+            local idx = _AR.MacroPlaceCounter
+            _AR.MacroPendingPlace = _AR.MacroPendingPlace + 1
+            local unitName = uuidToUnitName(uuid) or "?"
+            table.insert(_AR.CurrentMacro.Events, {
+                t = math.floor(t * 1000 + 0.5) / 1000,
+                Action = "Place",
+                UnitName = unitName,
+                CFrame = cfToArr(cf),
+                PlaceIdx = idx,
+            })
+
+        elseif name == "Upgrades" then
+            -- args[1] = model instance, args[2] = optional state number
+            local model = args[1]
+            local stateNum = tonumber(args[2])
+            local idx = nil
+            if typeof(model) == "Instance" then
+                local stats = model:FindFirstChild("Stats")
+                local urp = stats and stats:GetAttribute("UnitRealPlace")
+                if urp then idx = _AR.MacroRealPlaceToIdx[urp] end
+            end
+            if idx then
+                table.insert(_AR.CurrentMacro.Events, {
+                    t = math.floor(t * 1000 + 0.5) / 1000,
+                    Action = "Upgrade",
+                    PlaceIdx = idx,
+                    StateNum = stateNum,
+                })
+            end
+
+        elseif name == "SellUnit" then
+            -- args[1] = modelName, args[2] = UnitRealPlace
+            local urp = args[2]
+            local idx = urp and _AR.MacroRealPlaceToIdx[urp]
+            if idx then
+                table.insert(_AR.CurrentMacro.Events, {
+                    t = math.floor(t * 1000 + 0.5) / 1000,
+                    Action = "Sell",
+                    PlaceIdx = idx,
+                })
+            end
+
+        elseif name == "ChangeOrder" then
+            local model = args[1]
+            local idx = nil
+            if typeof(model) == "Instance" then
+                local stats = model:FindFirstChild("Stats")
+                local urp = stats and stats:GetAttribute("UnitRealPlace")
+                if urp then idx = _AR.MacroRealPlaceToIdx[urp] end
+            end
+            if idx then
+                table.insert(_AR.CurrentMacro.Events, {
+                    t = math.floor(t * 1000 + 0.5) / 1000,
+                    Action = "Order",
+                    PlaceIdx = idx,
+                })
+            end
+
+        elseif name == "ActiveSkill" then
+            -- From decompile (123.lua): ActiveSkill:FireServer(UnitRealPlace, UnitName)
+            --   v_u_9:WaitForChild("ActiveSkill"):FireServer(v_u_417, v_u_414)
+            -- where v_u_417 = UnitRealPlace attribute, v_u_414 = unit name.
+            local urp = args[1]
+            local unitName = args[2]
+            local idx = urp and _AR.MacroRealPlaceToIdx[urp]
+            if idx then
+                table.insert(_AR.CurrentMacro.Events, {
+                    t = math.floor(t * 1000 + 0.5) / 1000,
+                    Action = "ActiveSkill",
+                    PlaceIdx = idx,
+                    UnitName = unitName,
+                })
+            end
+
+        elseif name == "SkipWave" then
+            table.insert(_AR.CurrentMacro.Events, {
+                t = math.floor(t * 1000 + 0.5) / 1000,
+                Action = "SkipWave",
+                Vote = args[1] or "Yes",
+            })
+
+        elseif name == "UseItem" then
+            table.insert(_AR.CurrentMacro.Events, {
+                t = math.floor(t * 1000 + 0.5) / 1000,
+                Action = "UseItem",
+                Item = args[1],
+                Amount = tonumber(args[2]) or 1,
+            })
+        end
+    end
+    getgenv()._ARMacroRecordFn = recordDispatch
+
+    -- ─── CreateUnits2 listener (maps placeIdx → model during record AND playback) ─
+    local createUnits2 = Remotes:FindFirstChild("CreateUnits2")
+    if createUnits2 then
+        local conn = createUnits2.OnClientEvent:Connect(function(arg, playerName, placedModel)
+            if playerName ~= LocalPlayer.Name then return end
+            if typeof(placedModel) ~= "Instance" then return end
+            if _AR.MacroPendingPlace > 0 then
+                _AR.MacroPendingPlace = _AR.MacroPendingPlace - 1
+                -- Assign to the earliest idx that has no model yet
+                for idx = 1, _AR.MacroPlaceCounter do
+                    if _AR.MacroPlaceIdxToModel[idx] == nil then
+                        _AR.MacroPlaceIdxToModel[idx] = placedModel
+                        local stats = placedModel:FindFirstChild("Stats")
+                        local urp = stats and stats:GetAttribute("UnitRealPlace")
+                        if urp then _AR.MacroRealPlaceToIdx[urp] = idx end
+                        break
+                    end
+                end
+            end
+        end)
+        table.insert(_cleanupConns, conn)
+    end
+
+    -- ─── GameStart listener → reset & maybe auto-play macro ───────
+    local function resetMacroRuntime()
+        _AR.MacroT0 = tick()
+        _AR.MacroPlaceCounter = 0
+        _AR.MacroPendingPlace = 0
+        _AR.MacroPlaceIdxToModel = {}
+        _AR.MacroRealPlaceToIdx = {}
+    end
+
+    local gameStart = Remotes:FindFirstChild("GameStart")
+    if gameStart then
+        local conn = gameStart.OnClientEvent:Connect(function()
+            resetMacroRuntime()
+            if _AR.MacroRecording then
+                -- Clear previous events for a fresh recording of this match
+                _AR.CurrentMacro = {
+                    Meta = {
+                        stage      = _AR.SelectedStage,
+                        mode       = _AR.SelectedMode,
+                        chapter    = _AR.SelectedChapter,
+                        difficulty = _AR.SelectedDifficulty,
+                        placeId    = game.PlaceId,
+                        recordedAt = os.date("%Y-%m-%d %H:%M:%S"),
+                    },
+                    Events = {},
+                }
+                Notify("Macro recording: match started", 3)
+            end
+            if _AR.MacroAutoPlayOnStart and _AR.SelectedMacroName ~= "" and not _AR.MacroPlaying then
+                task.defer(function() _AR._playMacro(_AR.SelectedMacroName) end)
+            end
+        end)
+        table.insert(_cleanupConns, conn)
+    end
+
+    -- Auto Ready — click Ready when countdown appears
+    local cdStart = Remotes:FindFirstChild("CountDownStart")
+    if cdStart then
+        local conn = cdStart.OnClientEvent:Connect(function()
+            if _AR.MacroAutoReady then
+                safe(function() Remotes.Ready:FireServer() end)
+            end
+        end)
+        table.insert(_cleanupConns, conn)
+    end
+
+    -- Auto Skip Wave (vote Yes)
+    local countdownWave = Remotes:FindFirstChild("CountdownWave")
+    if countdownWave then
+        local conn = countdownWave.OnClientEvent:Connect(function()
+            if _AR.MacroAutoSkipWave then
+                task.delay(0.3, function()
+                    safe(function() Remotes.SkipWave:FireServer("Yes") end)
+                end)
+            end
+        end)
+        table.insert(_cleanupConns, conn)
+    end
+
+    -- ─── Playback ─────────────────────────────────────────────────
+    function _AR._playMacro(name)
+        if _AR.MacroPlaying then
+            Notify("Macro already playing", 2)
+            return
+        end
+        local macro, err = loadMacro(name)
+        if not macro or not macro.Events then
+            Notify("Load failed: " .. tostring(err), 3)
+            return
+        end
+        if #macro.Events == 0 then
+            Notify("Macro has no events", 3)
+            return
+        end
+
+        _AR.MacroPlaying = true
+        if _AR._refreshHookActive then _AR._refreshHookActive() end
+        -- Stage warning
+        if macro.Meta and macro.Meta.stage and _AR.SelectedStage ~= "" and macro.Meta.stage ~= _AR.SelectedStage then
+            Notify("⚠ Macro stage mismatch (" .. tostring(macro.Meta.stage) .. " vs " .. tostring(_AR.SelectedStage) .. ")", 5)
+        end
+
+        task.spawn(function()
+            -- Fresh runtime if match didn't just restart
+            resetMacroRuntime()
+            local events = macro.Events
+            table.sort(events, function(a, b) return (a.t or 0) < (b.t or 0) end)
+            local startT = tick()
+            local speed = math.max(0.1, _AR.MacroSpeed or 1)
+            local playedPlaceCounter = 0
+            dbg("Playing macro: " .. name .. " (" .. #events .. " events)")
+
+            -- Position-based fallback resolver. Used when MacroPlaceIdxToModel
+            -- doesn't have a live model for a placeIdx (CreateUnits2 ACK was
+            -- missed or model was destroyed). Scans workspace.Unit[player]
+            -- for a unit within 4 studs of the recorded CFrame position.
+            local function resolveModelByPlaceIdx(placeIdx)
+                -- First try direct lookup
+                local direct = _AR.MacroPlaceIdxToModel[placeIdx]
+                if direct and direct.Parent then return direct end
+                -- Find the Place event for this placeIdx to get its CFrame
+                local placeEv
+                for _, e in ipairs(events) do
+                    if e.Action == "Place" and e.PlaceIdx == placeIdx then
+                        placeEv = e; break
+                    end
+                end
+                if not placeEv or not placeEv.CFrame then return nil end
+                local targetPos = arrToCf(placeEv.CFrame).Position
+                local unitRoot = Workspace:FindFirstChild("Unit")
+                local ownFolder = unitRoot and unitRoot:FindFirstChild(LocalPlayer.Name)
+                if not ownFolder then return nil end
+                local best, bestDist = nil, 16 -- within 4 studs
+                for _, m in ipairs(ownFolder:GetChildren()) do
+                    if m:IsA("Model") and m.PrimaryPart then
+                        local d = (m.PrimaryPart.Position - targetPos).Magnitude
+                        if d < bestDist then
+                            bestDist = d
+                            best = m
+                        end
+                    end
+                end
+                if best then
+                    -- Cache for subsequent events
+                    _AR.MacroPlaceIdxToModel[placeIdx] = best
+                end
+                return best
+            end
+
+            for i, ev in ipairs(events) do
+                if not _AR.MacroPlaying or not getgenv()._ARRunning then break end
+
+                local target = (ev.t or 0) / speed
+                local now = tick() - startT
+                if target > now then task.wait(target - now) end
+                if not _AR.MacroPlaying or not getgenv()._ARRunning then break end
+
+                local action = ev.Action
+                if action == "Place" then
+                    local uuid = unitNameToUuid(ev.UnitName)
+                    if uuid then
+                        playedPlaceCounter = playedPlaceCounter + 1
+                        _AR.MacroPlaceCounter = playedPlaceCounter
+                        local placeIdx = playedPlaceCounter
+
+                        if _AR.MacroPlaybackMode == "UnitRetry" then
+                            -- Retry mode: keep firing until the server ACKs
+                            -- placement via CreateUnits2 (MacroPlaceIdxToModel
+                            -- gets populated for this placeIdx) or the macro
+                            -- is stopped. Throttle retries to avoid flooding.
+                            _AR.MacroPendingPlace = _AR.MacroPendingPlace + 1
+                            local attempt = 0
+                            while _AR.MacroPlaying and getgenv()._ARRunning do
+                                attempt = attempt + 1
+                                local freshUuid = unitNameToUuid(ev.UnitName) or uuid
+                                safe(function()
+                                    Remotes.CreateUnits:FireServer(freshUuid, arrToCf(ev.CFrame))
+                                end)
+                                -- Wait up to 1s for ACK
+                                local t0 = tick()
+                                while (tick() - t0) < 1.0 do
+                                    local m = _AR.MacroPlaceIdxToModel[placeIdx]
+                                    if m and m.Parent then break end
+                                    task.wait(0.05)
+                                end
+                                local m = _AR.MacroPlaceIdxToModel[placeIdx]
+                                if m and m.Parent then
+                                    dbg(("Place OK (idx=%d, unit=%s, tries=%d)"):format(
+                                        placeIdx, tostring(ev.UnitName), attempt))
+                                    break
+                                end
+                                if attempt >= 60 then
+                                    dbg(("Place GAVE UP after %d tries (idx=%d, unit=%s)"):format(
+                                        attempt, placeIdx, tostring(ev.UnitName)))
+                                    break
+                                end
+                                -- Retry delay grows slightly to avoid spam
+                                task.wait(0.4 + math.min(attempt * 0.05, 0.8))
+                            end
+                        else
+                            -- Timed mode: fire once, don't wait for ACK
+                            _AR.MacroPendingPlace = _AR.MacroPendingPlace + 1
+                            safe(function()
+                                Remotes.CreateUnits:FireServer(uuid, arrToCf(ev.CFrame))
+                            end)
+                        end
+                    else
+                        dbg("Macro: unit '" .. tostring(ev.UnitName) .. "' not in team — skipping placement")
+                    end
+
+                elseif action == "Upgrade" then
+                    local model = resolveModelByPlaceIdx(ev.PlaceIdx)
+                    if not model or not model.Parent then
+                        -- Wait briefly for ack
+                        local t0 = tick()
+                        while (tick() - t0) < 1.5 do
+                            model = resolveModelByPlaceIdx(ev.PlaceIdx)
+                            if model and model.Parent then break end
+                            task.wait(0.05)
+                        end
+                    end
+                    if model and model.Parent then
+                        safe(function()
+                            if ev.StateNum then
+                                Remotes.Upgrades:FireServer(model, ev.StateNum)
+                            else
+                                Remotes.Upgrades:FireServer(model)
+                            end
+                        end)
+                    end
+
+                elseif action == "Sell" then
+                    local model = resolveModelByPlaceIdx(ev.PlaceIdx)
+                    if model and model.Parent then
+                        local stats = model:FindFirstChild("Stats")
+                        local urp = stats and stats:GetAttribute("UnitRealPlace")
+                        if urp then
+                            safe(function() Remotes.SellUnit:FireServer(model.Name, urp) end)
+                        end
+                    end
+
+                elseif action == "Order" then
+                    local model = resolveModelByPlaceIdx(ev.PlaceIdx)
+                    if model and model.Parent then
+                        safe(function() Remotes.ChangeOrder:FireServer(model) end)
+                    end
+
+                elseif action == "ActiveSkill" then
+                    local model = resolveModelByPlaceIdx(ev.PlaceIdx)
+                    if model and model.Parent then
+                        -- ActiveSkill uses UnitRealPlace (not model) per decompile
+                        local stats = model:FindFirstChild("Stats")
+                        local urp = stats and stats:GetAttribute("UnitRealPlace")
+                        if urp then
+                            safe(function()
+                                Remotes.ActiveSkill:FireServer(urp, ev.UnitName)
+                            end)
+                        end
+                    end
+
+                elseif action == "SkipWave" then
+                    safe(function() Remotes.SkipWave:FireServer(ev.Vote or "Yes") end)
+
+                elseif action == "UseItem" then
+                    safe(function() Remotes.UseItem:FireServer(ev.Item, ev.Amount or 1) end)
+                end
+            end
+
+            _AR.MacroPlaying = false
+            if _AR._refreshHookActive then _AR._refreshHookActive() end
+            dbg("Macro finished")
+        end)
+    end
+
+    function _AR._stopMacro()
+        _AR.MacroPlaying = false
+        if _AR._refreshHookActive then _AR._refreshHookActive() end
+    end
+
+    -- ═══════════════════════════════════════════════════════════════
+    -- UI: Left column (matches user mockup — single vertical flow)
+    -- ═══════════════════════════════════════════════════════════════
+    local macroListDD -- forward ref (needed by Save/Delete callbacks)
+
+    sec.MacrosL:Header({ Text = "Create Macro File" })
+
+    sec.MacrosL:Input({
+        Name = "Macro Name",
+        Default = "",
+        Placeholder = "MagicLab",
+        Callback = function(v) _AR.MacroInputName = v end,
+    }, "MacroName")
+
+    sec.MacrosL:Button({
+        Name = "Create Macro File",
+        Callback = function()
+            if #_AR.CurrentMacro.Events == 0 then
+                Notify("Nothing to save — record a match first", 3) return
+            end
+            local name = (_AR.MacroInputName or ""):gsub("[^%w%-_%s]", ""):gsub("^%s+", ""):gsub("%s+$", "")
+            if name == "" then name = os.date("macro_%Y%m%d_%H%M%S") end
+            if not _AR.CurrentMacro.Meta or not _AR.CurrentMacro.Meta.placeId then
+                _AR.CurrentMacro.Meta = {
+                    stage      = _AR.SelectedStage,
+                    mode       = _AR.SelectedMode,
+                    chapter    = _AR.SelectedChapter,
+                    difficulty = _AR.SelectedDifficulty,
+                    placeId    = game.PlaceId,
+                    recordedAt = os.date("%Y-%m-%d %H:%M:%S"),
+                }
+            end
+            local ok, err = saveMacro(name, _AR.CurrentMacro)
+            if ok then
+                Notify("Saved: " .. name, 3)
+                if macroListDD then
+                    local list = listMacros()
+                    if #list == 0 then list = { "None" } end
+                    pcall(function() macroListDD:ClearOptions() end)
+                    pcall(function() macroListDD:InsertOptions(list) end)
+                    pcall(function() macroListDD:UpdateSelection(name) end)
+                    _AR.SelectedMacroName = name
+                end
+            else
+                Notify("Save failed: " .. tostring(err), 4)
+            end
+        end,
+    })
+
+    sec.MacrosL:Header({ Text = "Import Macro" })
+
+    local importUrlText = ""
+    sec.MacrosL:Input({
+        Name = "Macro JSON URL",
+        Default = "",
+        Placeholder = "discord URL or paste.rs link",
+        Callback = function(v) importUrlText = v end,
+    }, "MacroImportURL")
+
+    sec.MacrosL:Button({
+        Name = "Import Macro",
+        Callback = function()
+            if importUrlText == "" then Notify("Paste URL first", 2) return end
+            task.spawn(function()
+                local ok, resp = pcall(game.HttpGet, game, importUrlText)
+                if not ok then Notify("HTTP fail: " .. tostring(resp), 4) return end
+                local okD, decoded = pcall(HttpService.JSONDecode, HttpService, resp)
+                if not okD or type(decoded) ~= "table" or type(decoded.Events) ~= "table" then
+                    Notify("Invalid macro JSON", 4) return
+                end
+                local name = (_AR.MacroInputName ~= "" and _AR.MacroInputName)
+                    or os.date("imported_%Y%m%d_%H%M%S")
+                local okS = saveMacro(name, decoded)
+                if okS and macroListDD then
+                    Notify("Imported: " .. name, 3)
+                    local list = listMacros()
+                    pcall(function() macroListDD:ClearOptions() end)
+                    pcall(function() macroListDD:InsertOptions(list) end)
+                    pcall(function() macroListDD:UpdateSelection(name) end)
+                    _AR.SelectedMacroName = name
+                end
+            end)
+        end,
+    })
+
+    sec.MacrosL:Header({ Text = "Macro" })
+
+    local initialList = listMacros()
+    if #initialList == 0 then initialList = { "None" } end
+
+    macroListDD = sec.MacrosL:Dropdown({
+        Name = "Select Macro",
+        Options = initialList,
+        Default = initialList[1],
+        Callback = function(v) _AR.SelectedMacroName = (v == "None") and "" or v end,
+    }, "MacroList")
+    _AR.SelectedMacroName = (initialList[1] == "None") and "" or initialList[1]
+
+    sec.MacrosL:Button({
+        Name = "Refresh List",
+        Callback = function()
+            local list = listMacros()
+            if #list == 0 then list = { "None" } end
+            pcall(function() macroListDD:ClearOptions() end)
+            pcall(function() macroListDD:InsertOptions(list) end)
+            pcall(function() macroListDD:UpdateSelection(list[1]) end)
+            _AR.SelectedMacroName = (list[1] == "None") and "" or list[1]
+            Notify(("%d macro(s)"):format(
+                (#list == 1 and list[1] == "None") and 0 or #list), 2)
+        end,
+    })
+
+    sec.MacrosL:Toggle({
+        Name = "Record",
+        Default = false,
+        Callback = function(v)
+            _AR.MacroRecording = v
+            if _AR._refreshHookActive then _AR._refreshHookActive() end
+            if v then
+                if _AR.MacroT0 == 0 then
+                    _AR.CurrentMacro = { Meta = {}, Events = {} }
+                    _AR.MacroPlaceCounter = 0
+                    _AR.MacroPendingPlace = 0
+                    _AR.MacroPlaceIdxToModel = {}
+                    _AR.MacroRealPlaceToIdx = {}
+                end
+                Notify("Recording… start match to begin", 2)
+            else
+                Notify(("Stopped. %d event(s) recorded"):format(#_AR.CurrentMacro.Events), 3)
+            end
+        end,
+    }, "MacroRecord")
+
+    sec.MacrosL:Button({
+        Name = "Delete Macro",
+        Callback = function()
+            if _AR.SelectedMacroName == "" then Notify("Nothing selected", 2) return end
+            deleteMacro(_AR.SelectedMacroName)
+            Notify("Deleted: " .. _AR.SelectedMacroName, 3)
+            local list = listMacros()
+            if #list == 0 then list = { "None" } end
+            pcall(function() macroListDD:ClearOptions() end)
+            pcall(function() macroListDD:InsertOptions(list) end)
+            pcall(function() macroListDD:UpdateSelection(list[1]) end)
+            _AR.SelectedMacroName = (list[1] == "None") and "" or list[1]
+        end,
+    })
+
+    sec.MacrosL:Button({
+        Name = "Export Macro",
+        Callback = function()
+            if _AR.SelectedMacroName == "" then Notify("Nothing selected", 2) return end
+            local m = loadMacro(_AR.SelectedMacroName)
+            if not m then Notify("Load failed", 3) return end
+            local ok, enc = pcall(HttpService.JSONEncode, HttpService, m)
+            if not ok then Notify("Encode failed", 3) return end
+            if setclipboard then
+                setclipboard(enc)
+                Notify(("Copied %d bytes to clipboard"):format(#enc), 3)
+            else
+                Notify("Clipboard unavailable", 3)
+            end
+        end,
+    })
+
+    sec.MacrosL:Toggle({
+        Name = "Play Selected Macro",
+        Default = false,
+        Callback = function(v)
+            if v then
+                if _AR.SelectedMacroName == "" then
+                    Notify("Select a macro first", 2)
+                    pcall(function() MacLib.Options["MacroPlay"]:UpdateState(false) end)
+                    return
+                end
+                if _AR.MacroPlaying then return end
+                _AR._playMacro(_AR.SelectedMacroName)
+                -- Auto-untoggle when playback finishes
+                task.spawn(function()
+                    while _AR.MacroPlaying and getgenv()._ARRunning do task.wait(0.5) end
+                    pcall(function() MacLib.Options["MacroPlay"]:UpdateState(false) end)
+                end)
+            else
+                _AR._stopMacro()
+            end
+        end,
+    }, "MacroPlay")
+
+    sec.MacrosL:Dropdown({
+        Name = "Playback Speed…",
+        Options = {
+            "Unit-Retry (wait until each unit is placed)",
+            "Timed 0.5×",
+            "Timed 1× (real-time)",
+            "Timed 1.5×",
+            "Timed 2×",
+            "Timed 3×",
+            "Timed 4×",
+        },
+        Default = "Unit-Retry (wait until each unit is placed)",
+        Callback = function(v)
+            if v:find("^Unit%-Retry") then
+                _AR.MacroPlaybackMode = "UnitRetry"
+                _AR.MacroSpeed = 1
+            else
+                _AR.MacroPlaybackMode = "Timed"
+                local m = v:match("Timed%s+([%d%.]+)")
+                _AR.MacroSpeed = tonumber(m) or 1
+            end
+        end,
+    }, "MacroSpeedMode")
+
+    -- ═══════════════════════════════════════════════════════════════
+    -- UI: Right column — status + options
+    -- ═══════════════════════════════════════════════════════════════
+    sec.MacrosR:Header({ Text = "How playback modes differ" })
+    sec.MacrosR:Paragraph({
+        Header = "Unit-Retry",
+        Body = "Each Place event fires CreateUnits repeatedly until the "
+            .. "server ACKs it (unit actually appears). Survives lag, cash "
+            .. "shortage, and invalid-zone clicks. Macro timing is ignored.",
+    })
+    sec.MacrosR:Paragraph({
+        Header = "Timed N×",
+        Body = "Plays events at recorded timestamps (sped up by N×). Fires "
+            .. "each Place once without waiting for ACK — much faster but "
+            .. "will skip placements if server rejects them.",
+    })
+
+    sec.MacrosR:Divider()
+    sec.MacrosR:Header({ Text = "Behavior" })
+
+    sec.MacrosR:Toggle({
+        Name = "Auto Play on Match Start",
+        Default = false,
+        Callback = function(v) _AR.MacroAutoPlayOnStart = v end,
+    }, "MacroAutoPlay")
+
+    sec.MacrosR:Toggle({
+        Name = "Auto Ready (on countdown)",
+        Default = false,
+        Callback = function(v) _AR.MacroAutoReady = v end,
+    }, "MacroAutoReady")
+
+    sec.MacrosR:Toggle({
+        Name = "Auto Skip Wave (vote Yes)",
+        Default = false,
+        Callback = function(v) _AR.MacroAutoSkipWave = v end,
+    }, "MacroAutoSkip")
+
+    sec.MacrosR:Divider()
+    sec.MacrosR:Header({ Text = "Live Status" })
+
+    local statusPara = sec.MacrosR:Paragraph({ Header = "Status", Body = "Idle" })
+    task.spawn(function()
+        while getgenv()._ARRunning do
+            task.wait(0.5)
+            local body
+            if _AR.MacroRecording then
+                body = string.format("● RECORDING\nEvents: %d\nPlacements: %d",
+                    #_AR.CurrentMacro.Events, _AR.MacroPlaceCounter)
+            elseif _AR.MacroPlaying then
+                body = string.format("▶ PLAYING: %s\nMode: %s\nPlacements: %d",
+                    _AR.SelectedMacroName,
+                    _AR.MacroPlaybackMode == "UnitRetry" and "Unit-Retry"
+                        or ("Timed " .. tostring(_AR.MacroSpeed) .. "×"),
+                    _AR.MacroPlaceCounter)
+            else
+                body = string.format("Idle\nMode: %s\nCurrent recording: %d event(s)\nSelected: %s",
+                    _AR.MacroPlaybackMode == "UnitRetry" and "Unit-Retry"
+                        or ("Timed " .. tostring(_AR.MacroSpeed) .. "×"),
+                    #_AR.CurrentMacro.Events,
+                    _AR.SelectedMacroName == "" and "(none)" or _AR.SelectedMacroName)
+            end
+            pcall(function() statusPara:UpdateBody(body) end)
+        end
+    end)
+
+    local macroMetaPara = sec.MacrosR:Paragraph({ Header = "Macro Info", Body = "Select a macro..." })
+    task.spawn(function()
+        while getgenv()._ARRunning do
+            task.wait(1)
+            if _AR.SelectedMacroName ~= "" then
+                local m = loadMacro(_AR.SelectedMacroName)
+                if m then
+                    local meta = m.Meta or {}
+                    local body = string.format(
+                        "Stage: %s\nMode: %s\nChapter: %s\nDifficulty: %s\nEvents: %d\nRecorded: %s",
+                        tostring(meta.stage or "?"), tostring(meta.mode or "?"),
+                        tostring(meta.chapter or "?"), tostring(meta.difficulty or "?"),
+                        m.Events and #m.Events or 0,
+                        tostring(meta.recordedAt or "?"))
+                    pcall(function() macroMetaPara:UpdateBody(body) end)
+                end
+            end
+        end
+    end)
+end)
+if not _ok_macros then warn("[ApelHub] MACROS tab setup failed: " .. tostring(_err_macros)) print("[ApelHub] MACROS:", _err_macros) end
+
+-- ════════════════════════════════════════════════════════════════
+-- SHOPS TAB
+-- ════════════════════════════════════════════════════════════════
+local _ok_shops, _err_shops = pcall(function()
+    local shopDefs = {
+        { key = "CoinsShop",    label = "Coins Shop",     data = CoinsShopData,   remote = Remotes.CoinsShop.Buy   },
+        { key = "RaidShop",     label = "Raid Shop",      data = RaidShopData,    remote = Remotes.RaidShop.Buy    },
+        { key = "WitchEvent",   label = "Witch Shop",     data = WitchEventData,  remote = Remotes.WitchEvent.Buy  },
+        { key = "TokyoEvent",   label = "Tokyo Shop",     data = TokyoEventData,  remote = Remotes.TokyoEvent.Buy  },
+        { key = "FateEvent",    label = "Fate Shop",      data = FateEventData,   remote = Remotes.FateEvent.Buy   },
+    }
+    -- Ragnarok has a sub-key; data.Shop
+    table.insert(shopDefs, {
+        key    = "RagnarokEvent",
+        label  = "Ragnarok Shop",
+        data   = (type(RagnarokData) == "table" and RagnarokData.Shop) or {},
+        remote = Remotes.RagnarokEvent.Buy,
+    })
+
+    local sideToggle = "ShopsL"
+    local side = sec.ShopsL
+
+    -- Buy one shop item. If stock data is available (data.<shop>.Stock[item]),
+    -- buy the full remaining stock in a single FireServer call. If stock is
+    -- unknown (unlimited item / fresh data / missing field), fall back to
+    -- buying 1 so unlimited items still work.
+    local function buyShopItem(shop, item)
+        local qty = shopStockRemaining(shop.key, item)
+        if qty == nil then
+            safe(function() shop.remote:FireServer(item, 1) end)
+            dbg(("[shop] %s: buying %s × 1 (stock unknown)"):format(shop.label, item))
+            return 1
+        end
+        if qty <= 0 then
+            dbg(("[shop] %s: %s sold out"):format(shop.label, item))
+            return 0
+        end
+        safe(function() shop.remote:FireServer(item, qty) end)
+        dbg(("[shop] %s: buying %s × %d"):format(shop.label, item, qty))
+        return qty
+    end
+
+    for i, shop in ipairs(shopDefs) do
+        if i > 3 then side = sec.ShopsR end
+        side:Header({ Text = shop.label })
+
+        local opts = {}
+        for name in pairs(shop.data) do table.insert(opts, name) end
+        table.sort(opts)
+        if #opts == 0 then opts = { "None" } end
+
+        _AR.AutoShopItems[shop.key] = {}
+        side:Dropdown({
+            Name = "Items to buy",
+            Multi = true,
+            Options = opts,
+            Default = {},
+            Callback = function(selected)
+                _AR.AutoShopItems[shop.key] = {}
+                for n, on in pairs(selected) do
+                    if on then _AR.AutoShopItems[shop.key][n] = true end
+                end
+            end,
+        }, "Shop_" .. shop.key .. "_Items")
+
+        side:Toggle({
+            Name = "Auto Buy — " .. shop.label,
+            Default = false,
+            Callback = function(v)
+                _AR.AutoShopEnabled[shop.key] = v
+                if v then
+                    local count = 0
+                    for _, on in pairs(_AR.AutoShopItems[shop.key] or {}) do
+                        if on then count = count + 1 end
+                    end
+                    if count == 0 then
+                        Notify("Select items first ↑", 3)
+                    else
+                        Notify(shop.label .. ": auto-buy ON (" .. count .. " items)", 2)
+                    end
+                end
+            end,
+        }, "Shop_" .. shop.key .. "_Toggle")
+
+        side:Divider()
+    end
+
+    -- Shared auto-buy loop: every 8s, for each enabled shop, fire buy
+    -- per selected item (using remaining stock if available, else single).
+    task.spawn(function()
+        while getgenv()._ARRunning do
+            task.wait(8)
+            for _, shop in ipairs(shopDefs) do
+                if _AR.AutoShopEnabled[shop.key] and _AR.ModulesLoaded then
+                    for item, on in pairs(_AR.AutoShopItems[shop.key] or {}) do
+                        if on then
+                            buyShopItem(shop, item)
+                            task.wait(0.25)
+                        end
+                    end
+                end
+            end
+        end
+    end)
+end)
+if not _ok_shops then warn("[ApelHub] SHOPS tab failed: " .. tostring(_err_shops)) end
+
+-- ════════════════════════════════════════════════════════════════
+-- CLAIMS TAB
+-- ════════════════════════════════════════════════════════════════
+local _ok_claims, _err_claims = pcall(function()
+    sec.ClaimL:Header({ Text = "Auto Quests" })
+
+    local questCategories = { "Daily", "Weekly", "Special", "Infinite", "Event" }
+    sec.ClaimL:Dropdown({
+        Name = "Categories",
+        Multi = true,
+        Options = questCategories,
+        Default = { Daily = true, Weekly = true, Special = true, Infinite = true, Event = true },
+        Callback = function(selected)
+            _AR.AutoQuestCategories = {}
+            for k, v in pairs(selected) do
+                if v then _AR.AutoQuestCategories[k] = true end
+            end
+        end,
+    }, "QuestCats")
+
+    -- Seed default
+    for _, c in ipairs(questCategories) do _AR.AutoQuestCategories[c] = true end
+
+    sec.ClaimL:Toggle({
+        Name = "Auto Claim Quests",
+        Default = false,
+        Callback = function(v) _AR.AutoQuestEnabled = v end,
+    }, "AutoQuest")
+
+    sec.ClaimL:Button({
+        Name = "Claim All Now",
+        Callback = function() _AR._questClaimOnce = true end,
+    })
+
+    local function tryClaimQuests()
+        local data = getClientData()
+        if not data or not data.Quest then return 0 end
+        local claimed = 0
+        for category, quests in pairs(data.Quest) do
+            if type(quests) == "table" and _AR.AutoQuestCategories[category]
+                and QuestData[category] and type(QuestData[category]) == "table" then
+                for name, q in pairs(quests) do
+                    if type(q) == "table" and q.Claim == false and type(q.Suc) == "number" then
+                        local cfg = QuestData[category][name]
+                        if cfg and type(cfg.Max) == "number" and q.Suc >= cfg.Max then
+                            safe(function() Remotes.Quest.Claim:FireServer(category, name) end)
+                            claimed = claimed + 1
+                            task.wait(0.15)
+                        end
+                    end
+                end
+            end
+        end
+        return claimed
+    end
+
+    task.spawn(function()
+        while getgenv()._ARRunning do
+            task.wait(10)
+            if (_AR.AutoQuestEnabled or _AR._questClaimOnce) and _AR.ModulesLoaded then
+                local n = tryClaimQuests()
+                if _AR._questClaimOnce and n > 0 then Notify("Claimed " .. n .. " quest(s)", 3) end
+                _AR._questClaimOnce = false
+            end
+        end
+    end)
+
+    -- Right: Other claims
+    sec.ClaimR:Header({ Text = "Rewards" })
+
+    sec.ClaimR:Toggle({
+        Name = "Auto Daily Login",
+        Default = false,
+        Callback = function(v) _AR.AutoDailyLoginEnabled = v end,
+    }, "AutoDailyLogin")
+
+    sec.ClaimR:Toggle({
+        Name = "Auto Level Rewards",
+        Default = false,
+        Callback = function(v) _AR.AutoLevelRewardEnabled = v end,
+    }, "AutoLevelReward")
+
+    sec.ClaimR:Toggle({
+        Name = "Auto Battlepass",
+        Default = false,
+        Callback = function(v) _AR.AutoBattlepassEnabled = v end,
+    }, "AutoBattlepass")
+
+    sec.ClaimR:Divider()
+    sec.ClaimR:Button({
+        Name = "Claim all Daily Login",
+        Callback = function()
+            local data = getClientData()
+            if not data or not data.DailyLogin then return end
+            local vip = isVip()
+            for i = 1, 7 do
+                local d = data.DailyLogin["Day" .. i]
+                if d and d.UnLock and d.Claim == false then
+                    safe(function() Remotes.DailyLogin.Claim:FireServer(i, false) end)
+                    task.wait(0.15)
+                end
+            end
+            if vip then
+                for i = 1, 7 do
+                    local d = data.DailyLogin["Day" .. (i + 7)]
+                    if d and d.UnLock and d.Claim == false then
+                        safe(function() Remotes.DailyLogin.Claim:FireServer(i + 7, true) end)
+                        task.wait(0.15)
+                    end
+                end
+            end
+        end,
+    })
+
+    sec.ClaimR:Button({
+        Name = "Claim all Level Rewards",
+        Callback = function()
+            local data = getClientData()
+            if not data or not data.LevelReward then return end
+            local lvl = readLevel()
+            for l = 5, 200, 5 do
+                if l <= lvl and data.LevelReward.LevelStage[tostring(l)] == false then
+                    safe(function() Remotes.LevelReward.Claim:FireServer(l) end)
+                    task.wait(0.15)
+                end
+            end
+        end,
+    })
+
+    sec.ClaimR:Button({
+        Name = "Claim Battlepass",
+        Callback = function() safe(function() Remotes.Battlepass.Claim:FireServer() end) end,
+    })
+
+    sec.ClaimR:Divider()
+    sec.ClaimR:Toggle({
+        Name = "Auto Claim Tournament",
+        Default = false,
+        Callback = function(v) _AR.AutoTournamentEnabled = v end,
+    }, "AutoTournament")
+
+    sec.ClaimR:Button({
+        Name = "Claim Tournament",
+        Callback = function() safe(function() Remotes.Tournament.Claim:FireServer() end) end,
+    })
+
+    -- Background loops
+    task.spawn(function()
+        while getgenv()._ARRunning do
+            task.wait(30)
+            if _AR.AutoDailyLoginEnabled and _AR.ModulesLoaded then
+                local data = getClientData()
+                if data and data.DailyLogin then
+                    local vip = isVip()
+                    for i = 1, 7 do
+                        local d = data.DailyLogin["Day" .. i]
+                        if d and d.UnLock and d.Claim == false then
+                            safe(function() Remotes.DailyLogin.Claim:FireServer(i, false) end)
+                            task.wait(0.2)
+                        end
+                    end
+                    if vip then
+                        for i = 1, 7 do
+                            local d = data.DailyLogin["Day" .. (i + 7)]
+                            if d and d.UnLock and d.Claim == false then
+                                safe(function() Remotes.DailyLogin.Claim:FireServer(i + 7, true) end)
+                                task.wait(0.2)
+                            end
+                        end
+                    end
+                end
+            end
+            if _AR.AutoLevelRewardEnabled and _AR.ModulesLoaded then
+                local data = getClientData()
+                if data and data.LevelReward then
+                    local lvl = readLevel()
+                    for l = 5, 200, 5 do
+                        if l <= lvl and data.LevelReward.LevelStage[tostring(l)] == false then
+                            safe(function() Remotes.LevelReward.Claim:FireServer(l) end)
+                            task.wait(0.2)
+                        end
+                    end
+                end
+            end
+            if _AR.AutoBattlepassEnabled and _AR.ModulesLoaded then
+                safe(function() Remotes.Battlepass.Claim:FireServer() end)
+            end
+            if _AR.AutoTournamentEnabled and _AR.ModulesLoaded then
+                -- Tournament.Claim is idempotent on server side; safe to fire periodically
+                safe(function() Remotes.Tournament.Claim:FireServer() end)
+            end
+        end
+    end)
+end)
+if not _ok_claims then warn("[ApelHub] CLAIMS tab failed: " .. tostring(_err_claims)) end
+
+-- ════════════════════════════════════════════════════════════════
+-- EVENTS TAB (Capsules + Event Claims + Triggers + Sacrifices)
+-- ════════════════════════════════════════════════════════════════
+local _ok_events, _err_events = pcall(function()
+    -- ─── Left: Auto Use Capsules + Auto Event Claim ─────────────────
+    sec.EventsL:Header({ Text = "Auto Use Capsules" })
+
+    local CAPSULES = { "Chip Capsule", "Ragnarok Capsule", "Tokyo Capsule" }
+
+    sec.EventsL:Dropdown({
+        Name = "Capsules to use",
+        Multi = true,
+        Options = CAPSULES,
+        Default = {},
+        Callback = function(selected)
+            _AR.AutoCapsuleItems = {}
+            for name, on in pairs(selected) do
+                if on then _AR.AutoCapsuleItems[name] = true end
+            end
+        end,
+    }, "CapsuleItems")
+
+    sec.EventsL:Slider({
+        Name = "Use amount per tick",
+        Default = 1, Minimum = 1, Maximum = 100, Precision = 0,
+        DisplayMethod = "Value",
+        Callback = function(v) _AR.AutoCapsuleAmount = v end,
+    }, "CapsuleAmount")
+
+    sec.EventsL:Toggle({
+        Name = "Auto Use Capsules",
+        Default = false,
+        Callback = function(v) _AR.AutoCapsuleEnabled = v end,
+    }, "AutoCapsule")
+
+    sec.EventsL:Button({
+        Name = "Use selected now",
+        Callback = function() _AR._capsuleOnce = true end,
+    })
+
+    sec.EventsL:Paragraph({
+        Header = "Hint",
+        Body = "Uses Item.Use(name, amount). Batches 'amount' per iteration (server rate-limited).\nCapsules drop keys/shards/portals. Won't fire if you have 0 in inventory.",
+    })
+
+    local function inventoryAmount(data, itemType, itemName)
+        if not (data and data.Item) then return 0 end
+        local bucket = data.Item[itemType]
+        if type(bucket) ~= "table" then return 0 end
+        local v = bucket[itemName]
+        if type(v) == "number" then return v end
+        if type(v) == "table" and type(v.Amount) == "number" then return v.Amount end
+        return 0
+    end
+
+    task.spawn(function()
+        while getgenv()._ARRunning do
+            task.wait(2)
+            if (_AR.AutoCapsuleEnabled or _AR._capsuleOnce) and _AR.ModulesLoaded then
+                _AR._capsuleOnce = false
+                local data = getClientData()
+                if data then
+                    for name, on in pairs(_AR.AutoCapsuleItems) do
+                        if on then
+                            local owned = inventoryAmount(data, "Capsules", name)
+                            if owned > 0 then
+                                local amt = math.min(_AR.AutoCapsuleAmount, owned)
+                                safe(function() Remotes.Item.Use:FireServer(name, amt) end)
+                                task.wait(0.35)
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end)
+
+    sec.EventsL:Divider()
+    sec.EventsL:Header({ Text = "Auto Event Claim" })
+
+    -- Event names from QuestData.Event
+    local eventNames = {}
+    if type(QuestData) == "table" and type(QuestData.Event) == "table" then
+        for ev in pairs(QuestData.Event) do table.insert(eventNames, ev) end
+    end
+    table.sort(eventNames)
+    if #eventNames == 0 then eventNames = { "None" } end
+
+    -- Pre-select all events by default
+    local defaultEventSel = {}
+    for _, ev in ipairs(eventNames) do
+        defaultEventSel[ev] = true
+        _AR.AutoEventCategories[ev] = true
+    end
+
+    sec.EventsL:Dropdown({
+        Name = "Events to auto-claim",
+        Multi = true,
+        Options = eventNames,
+        Default = defaultEventSel,
+        Callback = function(selected)
+            _AR.AutoEventCategories = {}
+            for ev, on in pairs(selected) do
+                if on then _AR.AutoEventCategories[ev] = true end
+            end
+        end,
+    }, "AutoEventCats")
+
+    sec.EventsL:Toggle({
+        Name = "Auto Claim Event Quests",
+        Default = false,
+        Callback = function(v) _AR.AutoEventClaimEnabled = v end,
+    }, "AutoEventClaim")
+
+    local function tryClaimEvents()
+        local data = getClientData()
+        if not (data and data.Event) then return 0 end
+        local claimed = 0
+        for evName, evQuests in pairs(data.Event) do
+            if type(evQuests) == "table" and _AR.AutoEventCategories[evName]
+                and QuestData.Event[evName] and type(QuestData.Event[evName]) == "table" then
+                for qName, q in pairs(evQuests) do
+                    if type(q) == "table" and q.Claim == false and type(q.Suc) == "number" then
+                        local cfg = QuestData.Event[evName][qName]
+                        if cfg and type(cfg.Max) == "number" and q.Suc >= cfg.Max then
+                            safe(function() Remotes.Quest.ClaimEvent:FireServer(evName, qName) end)
+                            claimed = claimed + 1
+                            task.wait(0.2)
+                        end
+                    end
+                end
+            end
+        end
+        return claimed
+    end
+
+    sec.EventsL:Button({
+        Name = "Claim Events Now",
+        Callback = function()
+            local n = tryClaimEvents()
+            Notify(n > 0 and ("Claimed " .. n .. " event(s)") or "Nothing ready", 3)
+        end,
+    })
+
+    task.spawn(function()
+        while getgenv()._ARRunning do
+            task.wait(15)
+            if _AR.AutoEventClaimEnabled and _AR.ModulesLoaded then
+                tryClaimEvents()
+            end
+        end
+    end)
+
+    -- ─── Right: Event Triggers + Sacrifices ─────────────────────
+    sec.EventsR:Header({ Text = "Event Triggers" })
+    sec.EventsR:Paragraph({
+        Header = "What this does",
+        Body = "Each button fires a one-shot event remote (no args). Requires matching quest progress or item. If nothing happens the event isn't active / not ready.",
+    })
+
+    local EVENT_TRIGGERS = {
+        -- Label                    RemoteName in RS.Remotes.Quest
+        { "Dragon Dagger Quest",    "DragonDaggerQuest"  },
+        { "Golden Ring Quest",      "GoldenRingQuest"    },
+        { "Haki Hat Quest",         "HakiHat"            },
+        { "Twilight Quest",         "TwilightQuest"      },
+        { "Dual Pistol Quest",      "DualPistol"         },
+        { "Kafra Quest",            "KafraQuest"         },
+        { "Kafra Buy",              "KafraBuy"           },
+        { "Hutao Quest",            "HutaoQuest"         },
+        { "Hutao Quest II",         "HutaoQuest2"        },
+        { "White Queen Quest",      "WhiteQueenQuest"    },
+        { "Zafkial Quest",          "ZafkialQuest"       },
+        { "Get Zafkial",            "GetZafkial"         },
+        { "Get White Queen",        "GetWhiteQueen"      },
+    }
+
+    for _, def in ipairs(EVENT_TRIGGERS) do
+        local label, remoteName = def[1], def[2]
+        sec.EventsR:Button({
+            Name = label,
+            Callback = function()
+                local r = Remotes.Quest:FindFirstChild(remoteName)
+                if not r then Notify("Remote missing: " .. remoteName, 3) return end
+                safe(function() r:FireServer() end)
+                Notify("Fired: " .. label, 2)
+            end,
+        })
+    end
+
+    sec.EventsR:Divider()
+    sec.EventsR:Header({ Text = "⚠ Sacrifice (destructive)" })
+    sec.EventsR:Paragraph({
+        Header = "Warning",
+        Body = "These DESTROY units. Paste exact UUIDs separated by commas. Counts are enforced client-side by the game (Kafra=4, Gilgamash=5, Zafkial=10, WhiteQueen=5).",
+    })
+
+    local sacUuidText = ""
+    sec.EventsR:Input({
+        Name = "Unit UUIDs (comma-separated)",
+        Default = "",
+        Placeholder = "uuid1,uuid2,uuid3,...",
+        Callback = function(v) sacUuidText = v end,
+    }, "SacUuids")
+
+    local function parseUuids()
+        local out = {}
+        for u in string.gmatch(sacUuidText or "", "[^,%s]+") do
+            if #u >= 6 then table.insert(out, u) end
+        end
+        return out
+    end
+
+    local SACRIFICES = {
+        { "Kafra Sacrifice (x4)",        "KafraSac",       4  },
+        { "Gilgamash Sacrifice (x5)",    "GilgamashSac",   5  },
+        { "Zafkial Sacrifice (x10)",     "ZafkialSac",     10 },
+        { "White Queen Sacrifice (x5)",  "WhiteQueenSac",  5  },
+    }
+
+    for _, def in ipairs(SACRIFICES) do
+        local label, remoteName, required = def[1], def[2], def[3]
+        sec.EventsR:Button({
+            Name = label,
+            Callback = function()
+                local list = parseUuids()
+                if #list ~= required then
+                    Notify(("Need exactly %d UUIDs (have %d)"):format(required, #list), 4)
+                    return
+                end
+                local r = Remotes.Quest:FindFirstChild(remoteName)
+                if not r then Notify("Remote missing: " .. remoteName, 3) return end
+                safe(function() r:FireServer(list) end)
+                Notify("Sacrificed " .. required .. " units", 3)
+            end,
+        })
+    end
+end)
+if not _ok_events then warn("[ApelHub] EVENTS tab failed: " .. tostring(_err_events)) end
+
+-- ════════════════════════════════════════════════════════════════
+-- CODES TAB
+-- ════════════════════════════════════════════════════════════════
+local _ok_codes, _err_codes = pcall(function()
+    sec.CodesL:Header({ Text = "Redeem Code" })
+
+    local codeText = ""
+    sec.CodesL:Input({
+        Name = "Code",
+        Default = "",
+        Placeholder = "Enter a code",
+        Callback = function(v) codeText = v end,
+    }, "CodeInput")
+
+    sec.CodesL:Button({
+        Name = "Redeem",
+        Callback = function()
+            local c = (codeText or ""):gsub("%s", "")
+            if #c < 2 or #c > 32 then Notify("Invalid code length", 3) return end
+            safe(function() Remotes.RedeemCode:FireServer(c) end)
+            Notify("Sent: " .. c, 2)
+        end,
+    })
+
+    -- ─── Known Codes database (update this list when new codes drop) ──
+    local KNOWN_CODES = {
+        "100KVISITS", "10KMembers", "15KFAVORITES", "15KMembers", "1MVISITS",
+        "20KLIKES", "20KMembers", "2MVISITS", "30KLIKES", "35KLIKES", "3MVISITS",
+        "3POIT5MVISITS", "40KLIKES", "500KVISITS", "67",
+        "AnimeRemovesal", "AnimeReversal", "ARTIFACT", "ATOMIC",
+        "GILGAMASHCASTLE", "ILOVEEMILA", "ILOVEKAFRA", "JetozaCH", "KUROMI",
+        "MrRhino", "NEWBP", "RAGNAROK", "RagnarokBuff", "RagnarokBuff2",
+        "RAID", "Release", "RIKTIME", "SorryForBugs1", "SryForBug3",
+        "SryForDelay1", "SupportCodeReleasess", "TKZ", "TOKYO",
+        "UPDATE0.5", "UPDATE1", "UPDATE2", "UPDATE2.5", "UPDATE2POINT5",
+        "UPDATE3", "UPDATE3POINT5", "UPDATEZEROPOINTFIVE",
+        "Watchpixel", "Winter", "ZerozKingner",
+    }
+
+    local function redeemAllKnown(delayBetween)
+        delayBetween = delayBetween or 0.9
+        local sent, total = 0, #KNOWN_CODES
+        for _, c in ipairs(KNOWN_CODES) do
+            if not getgenv()._ARRunning then break end
+            safe(function() Remotes.RedeemCode:FireServer(c) end)
+            sent = sent + 1
+            task.wait(delayBetween)
+        end
+        Notify(("Redeemed %d/%d known codes"):format(sent, total), 4)
+        dbg(("[codes] redeemAllKnown: %d/%d sent"):format(sent, total))
+    end
+
+    sec.CodesL:Divider()
+    sec.CodesL:Header({ Text = "Known Codes" })
+    sec.CodesL:Paragraph({
+        Header = ("Database: %d codes"):format(#KNOWN_CODES),
+        Body = "Fires every known code once. Invalid / already-redeemed codes "
+            .. "are silently ignored by the server. Delay 0.9s between calls.",
+    })
+    sec.CodesL:Button({
+        Name = "▶ Redeem ALL known now",
+        Callback = function()
+            task.spawn(function() redeemAllKnown(0.9) end)
+            Notify(("Redeeming %d codes…"):format(#KNOWN_CODES), 3)
+        end,
+    })
+    sec.CodesL:Toggle({
+        Name = "Auto-redeem on hub load",
+        Default = false,
+        Callback = function(v) _AR.AutoRedeemOnLoad = v end,
+    }, "AutoRedeemOnLoad")
+
+    -- Run once shortly after hub starts (user preference was restored by
+    -- MacLib's autoload via the flag above).
+    task.spawn(function()
+        task.wait(5)
+        if _AR.AutoRedeemOnLoad and getgenv()._ARRunning then
+            dbg("[codes] auto-redeem on load firing")
+            redeemAllKnown(0.9)
+        end
+    end)
+
+    sec.CodesR:Header({ Text = "Batch Redeem" })
+    sec.CodesR:Paragraph({
+        Header = "Hint",
+        Body = "Paste codes separated by commas, spaces or new lines. They'll be redeemed one by one.",
+    })
+    local batchText = ""
+    sec.CodesR:Input({
+        Name = "Codes",
+        Default = "",
+        Placeholder = "CODE1, CODE2, CODE3...",
+        Callback = function(v) batchText = v end,
+    }, "BatchCodeInput")
+
+    sec.CodesR:Button({
+        Name = "Redeem All",
+        Callback = function()
+            local t = {}
+            for c in string.gmatch(batchText or "", "[%w%-_]+") do
+                if #c >= 2 and #c <= 32 then table.insert(t, c) end
+            end
+            if #t == 0 then Notify("No valid codes", 3) return end
+            task.spawn(function()
+                for _, c in ipairs(t) do
+                    safe(function() Remotes.RedeemCode:FireServer(c) end)
+                    task.wait(0.9)
+                end
+                Notify("Sent " .. #t .. " codes", 3)
+            end)
+        end,
+    })
+end)
+if not _ok_codes then warn("[ApelHub] CODES tab failed: " .. tostring(_err_codes)) end
+
+-- ════════════════════════════════════════════════════════════════
+-- TELEPORT TAB
+-- ════════════════════════════════════════════════════════════════
+local _ok_teleport, _err_teleport = pcall(function()
+    sec.TpL:Header({ Text = "Areas" })
+
+    local areaFolder = Workspace:FindFirstChild("Area")
+    local areaButtons = {}
+    if areaFolder then
+        local names = {}
+        for _, part in ipairs(areaFolder:GetChildren()) do
+            if part:IsA("BasePart") and part.Name ~= "PlayHide" then
+                table.insert(names, part.Name)
+            end
+        end
+        table.sort(names)
+
+        local side = sec.TpL
+        local counter = 0
+        for _, name in ipairs(names) do
+            counter = counter + 1
+            if counter == math.ceil(#names / 2) + 1 then side = sec.TpR end
+            side:Button({
+                Name = "→ " .. name,
+                Callback = function()
+                    safe(function()
+                        local char = LocalPlayer.Character or LocalPlayer.CharacterAdded:Wait()
+                        local hrp = char:WaitForChild("HumanoidRootPart", 5)
+                        if not hrp then Notify("HRP missing", 2) return end
+                        local part = areaFolder:FindFirstChild(name)
+                        if not part then return end
+                        local yOffset = part:GetAttribute("YOffset") or 4
+                        local cf = part.CFrame + Vector3.new(0, yOffset, 0)
+                        hrp.CFrame = CFrame.new(cf.Position, cf.Position + cf.LookVector)
+                    end)
+                    Notify("→ " .. name, 1.5)
+                end,
+            })
+        end
+    else
+        sec.TpL:Paragraph({ Header = "Areas", Body = "workspace.Area not found — try rejoining" })
+    end
+end)
+if not _ok_teleport then warn("[ApelHub] TELEPORT tab setup failed: " .. tostring(_err_teleport)) print("[ApelHub] TELEPORT:", _err_teleport) end
+
+-- ════════════════════════════════════════════════════════════════
+-- MISC TAB (Profile, StatTransfer, Tournament...)
+-- ════════════════════════════════════════════════════════════════
+local _ok_misc, _err_misc = pcall(function()
+    sec.MiscL:Header({ Text = "Info" })
+
+    local playerInfo = sec.MiscL:Paragraph({ Header = "Player", Body = "Loading..." })
+    task.spawn(function()
+        while getgenv()._ARRunning do
+            task.wait(2)
+            local data = getClientData()
+            local body
+            if data and data.Unit then
+                local owned = 0
+                for _ in pairs(data.Unit) do owned = owned + 1 end
+                local equipCount = 0
+                local eq = data.Team and data.Team[data.Team.TeamEquipping] or {}
+                if type(eq) == "table" then
+                    for _, u in pairs(eq) do
+                        if u and u ~= "" then equipCount = equipCount + 1 end
+                    end
+                end
+                local totalKills = tonumber((data.Data or {}).MobKill) or 0
+                body = string.format(
+                    "Name: %s\nLevel: %d  ·  BP Lv: %d  ·  VIP: %s\n" ..
+                    "Units: %d  ·  Team: %d/6\nTotal kills: %s\nMMR: %s  ·  Queue: %s",
+                    LocalPlayer.Name, readLevel(), getBattlePassLevel(),
+                    tostring(isVip()), owned, equipCount,
+                    tostring(totalKills),
+                    tostring(LocalPlayer:GetAttribute("MMR") or "?"),
+                    tostring(isInQueue())
+                )
+            else
+                body = "(no data)"
+            end
+            pcall(function() playerInfo:UpdateBody(body) end)
+        end
+    end)
+
+    sec.MiscL:Divider()
+    sec.MiscL:Header({ Text = "Actions" })
+
+    sec.MiscL:Button({
+        Name = "Request fresh PlayerData",
+        Callback = function()
+            local rf = Remotes.PlayerData:FindFirstChild("ReturnData")
+            if rf and rf:IsA("RemoteFunction") then
+                safe(function()
+                    local data = rf:InvokeServer()
+                    print("[ApelHub] ReturnData got:", type(data), data and "(table)" or "")
+                    Notify("PlayerData refreshed", 2)
+                end)
+            else
+                Notify("ReturnData remote not found", 3)
+            end
+        end,
+    })
+    sec.MiscL:Button({
+        Name = "Start Tournament (open queue screen)",
+        Callback = function()
+            safe(function()
+                local p = Remotes:FindFirstChild("Play")
+                local sp = p and p:FindFirstChild("StartPlay")
+                if sp then
+                    sp:FireServer("Tournament")
+                else
+                    Notify("Play.StartPlay not available (gameplay server)", 3)
+                end
+            end)
+        end,
+    })
+
+    -- Right: Misc toggles / debug
+    sec.MiscR:Header({ Text = "Debug" })
+    sec.MiscR:Toggle({
+        Name = "Debug prints",
+        Default = false,
+        Callback = function(v) _AR.EnableDebug = v end,
+    }, "DebugPrints")
+
+    -- ───────────────────────────────────────────────────────────────
+    -- Unified diagnostic dump: forces PlayerData refresh, serializes
+    -- ClientData + Remotes tree, copies everything to clipboard so user
+    -- can paste it back to us for analysis.
+    -- ───────────────────────────────────────────────────────────────
+    local function serializeValue(v, depth, maxDepth, seen)
+        depth = depth or 0
+        maxDepth = maxDepth or 6
+        seen = seen or {}
+        local t = typeof(v)
+        if t == "nil" then return "nil" end
+        if t == "boolean" then return tostring(v) end
+        if t == "number" then return tostring(v) end
+        if t == "string" then
+            if #v > 200 then v = v:sub(1, 200) .. "…" end
+            return string.format("%q", v)
+        end
+        if t == "Instance" then return ("<%s %q>"):format(v.ClassName, v:GetFullName()) end
+        if t == "CFrame" then return "CFrame.new(" .. tostring(v) .. ")" end
+        if t == "Vector3" then return "Vector3(" .. tostring(v) .. ")" end
+        if t == "Color3" then return "Color3(" .. tostring(v) .. ")" end
+        if t == "Enum" or t == "EnumItem" then return tostring(v) end
+        if t == "function" then return "<function>" end
+        if t == "table" then
+            if seen[v] then return "<cycle>" end
+            seen[v] = true
+            if depth >= maxDepth then return "{...}" end
+            -- Check if array-like (consecutive integer keys)
+            local n = 0
+            for _ in pairs(v) do n = n + 1 end
+            if n == 0 then return "{}" end
+
+            local indent  = string.rep("  ", depth + 1)
+            local closing = string.rep("  ", depth)
+            local parts = {}
+            -- Sort keys for stable output
+            local keys = {}
+            for k in pairs(v) do keys[#keys + 1] = k end
+            table.sort(keys, function(a, b)
+                local ta, tb = type(a), type(b)
+                if ta ~= tb then return ta < tb end
+                return tostring(a) < tostring(b)
+            end)
+            -- Truncate if way too big
+            local MAX_ENTRIES = 300
+            local shown = 0
+            for _, k in ipairs(keys) do
+                if shown >= MAX_ENTRIES then
+                    parts[#parts + 1] = indent .. ("-- ...+ %d more keys"):format(n - shown)
+                    break
+                end
+                shown = shown + 1
+                local keyStr
+                if type(k) == "string" and k:match("^[_%a][_%w]*$") then
+                    keyStr = k
+                else
+                    keyStr = "[" .. serializeValue(k, depth + 1, maxDepth, seen) .. "]"
+                end
+                parts[#parts + 1] = indent .. keyStr .. " = " .. serializeValue(v[k], depth + 1, maxDepth, seen)
+            end
+            seen[v] = nil
+            return "{\n" .. table.concat(parts, ",\n") .. "\n" .. closing .. "}"
+        end
+        return "<" .. t .. ">"
+    end
+
+    sec.MiscR:Button({
+        Name = "📋 Dump Everything → Clipboard",
+        Callback = function()
+            Notify("Building dump…", 3)
+            task.spawn(function()
+                local lines = {}
+                local function push(s) lines[#lines + 1] = s end
+
+                push("============================================================")
+                push("APEL HUB DIAGNOSTIC DUMP")
+                push(("Date: %s"):format(os.date("%Y-%m-%d %H:%M:%S")))
+                push(("PlaceId: %s  (server: %s)"):format(
+                    tostring(game.PlaceId),
+                    _AR.IsGameplayServer and "GAMEPLAY" or "LOBBY"))
+                push(("Player: %s (UserId %d)"):format(LocalPlayer.Name, LocalPlayer.UserId))
+                push("============================================================")
+                push("")
+
+                -- 1) Force ReturnData so data.Unit is populated on gameplay server
+                push("── 1. PlayerData.ReturnData:InvokeServer() ──")
+                local rf = Remotes:FindFirstChild("PlayerData")
+                rf = rf and rf:FindFirstChild("ReturnData")
+                if rf and rf:IsA("RemoteFunction") then
+                    local ok, ret = pcall(function() return rf:InvokeServer() end)
+                    if ok then
+                        push(("Returned: type=%s"):format(type(ret)))
+                        if type(ret) == "table" then
+                            local n = 0
+                            for _ in pairs(ret) do n = n + 1 end
+                            push(("Top-level keys: %d"):format(n))
+                        end
+                    else
+                        push("InvokeServer error: " .. tostring(ret))
+                    end
+                else
+                    push("(RemoteFunction not available)")
+                end
+                push("")
+
+                -- 2) Full serialized ClientData
+                push("── 2. PlayerDataClient.GetClientData() ──")
+                local data = getClientData()
+                if type(data) == "table" then
+                    local ok, serialized = pcall(serializeValue, data, 0, 8, {})
+                    if ok then
+                        push(serialized)
+                    else
+                        push("Serialize failed: " .. tostring(serialized))
+                    end
+                else
+                    push(("Data type: %s"):format(type(data)))
+                end
+                push("")
+
+                -- 3) Full remote tree
+                push("── 3. ReplicatedStorage.Remotes tree ──")
+                local count = 0
+                local remoteList = {}
+                for _, r in ipairs(Remotes:GetDescendants()) do
+                    if r:IsA("RemoteEvent") or r:IsA("RemoteFunction") or r:IsA("BindableEvent") or r:IsA("BindableFunction") then
+                        count = count + 1
+                        table.insert(remoteList, ("  [%s] %s"):format(r.ClassName, r:GetFullName()))
+                    end
+                end
+                table.sort(remoteList)
+                push(("Total: %d"):format(count))
+                for _, line in ipairs(remoteList) do push(line) end
+                push("")
+
+                -- 4) Workspace.PlayFolder snapshot (relevant for in-match)
+                push("── 4. workspace.PlayFolder ──")
+                local pf = Workspace:FindFirstChild("PlayFolder")
+                if pf then
+                    for _, c in ipairs(pf:GetChildren()) do
+                        push(("  %s [%s]"):format(c:GetFullName(), c.ClassName))
+                    end
+                else
+                    push("(none)")
+                end
+                push("")
+
+                push("============================================================")
+                push(("END OF DUMP (%d lines)"):format(#lines + 1))
+                push("============================================================")
+
+                local full = table.concat(lines, "\n")
+
+                if setclipboard then
+                    local okCB, errCB = pcall(setclipboard, full)
+                    if okCB then
+                        Notify(("Copied to clipboard (%d chars, %d lines)"):format(#full, #lines), 6)
+                    else
+                        Notify("Clipboard fail: " .. tostring(errCB), 5)
+                        print(full)
+                    end
+                else
+                    Notify("Clipboard unavailable — dumped to console", 5)
+                    print(full)
+                end
+
+                -- Also write to a file as safety net for very large dumps
+                pcall(function()
+                    if writefile then
+                        writefile("ApelHub/last_dump.txt", full)
+                    end
+                end)
+            end)
+        end,
+    })
+
+    -- ═══════════════════════════════════════════════════════════════
+    -- Place Anywhere (bypass client placement zone check)
+    --
+    -- Flow:
+    -- 1. User holds a unit (ghost model appears in workspace).
+    -- 2. User clicks somewhere. Two cases:
+    --    (a) valid tile: game script fires CreateUnits(uuid, cf). Our
+    --        namecall hook rewrites cf → mouse-hit position and also
+    --        bumps _ARLastCreateUnitsFire. Placement succeeds.
+    --    (b) invalid tile (roof, water, etc): game script's own validator
+    --        rejects the click and CreateUnits is NOT fired. Our LMB
+    --        listener waits 80 ms, sees _ARLastCreateUnitsFire wasn't
+    --        bumped, and fires CreateUnits itself with mouse-hit position.
+    -- ═══════════════════════════════════════════════════════════════
+    sec.MiscR:Divider()
+    sec.MiscR:Header({ Text = "Place Anywhere" })
+
+    sec.MiscR:Paragraph({
+        Header = "How to use",
+        Body = "Turn ON, then in-match grab a unit from team slots (Unit1..6) "
+             .. "as usual. Click anywhere — paths, roofs, water, air, off-map. "
+             .. "Only equipped team units work (server validates team).",
+    })
+
+    -- Use camera+viewport raycast instead of LocalPlayer:GetMouse().
+    -- Raycast excludes LocalPlayer character and the ghost itself so we
+    -- never hit them by accident.
+    local function raycastMouse()
+        local cam = Workspace.CurrentCamera
+        if not cam then return nil end
+        local mp = UserInputService:GetMouseLocation()
+        local ray = cam:ViewportPointToRay(mp.X, mp.Y, 0)
+        local params = RaycastParams.new()
+        params.FilterType = Enum.RaycastFilterType.Exclude
+        local filter = {}
+        if LocalPlayer.Character then table.insert(filter, LocalPlayer.Character) end
+        params.FilterDescendantsInstances = filter
+        local hit = Workspace:Raycast(ray.Origin, ray.Direction * 1500, params)
+        if hit then
+            return CFrame.new(hit.Position)
+        end
+        -- Fallback: project a fixed distance into the ray
+        return CFrame.new(ray.Origin + ray.Direction * 200)
+    end
+
+    -- Find the holding-ghost model. The game puts it in workspace.HoldingUnit
+    -- (not workspace root) — see decompile line v_u_54.Parent = v_u_10 where
+    -- v_u_10 = workspace:WaitForChild("HoldingUnit"). Fallback: scan root for
+    -- a Model with UnitRealName attribute but no Stats child (in case game
+    -- version differs).
+    local function findHoldingGhost()
+        local hu = Workspace:FindFirstChild("HoldingUnit")
+        if hu then
+            for _, m in ipairs(hu:GetChildren()) do
+                if m:IsA("Model") and m:GetAttribute("UnitRealName") then
+                    return m
+                end
+            end
+        end
+        -- Fallback: old heuristic (root workspace scan)
+        local playFolder = Workspace:FindFirstChild("PlayFolder")
+        local ownFolder  = playFolder and playFolder:FindFirstChild(LocalPlayer.Name)
+        for _, m in ipairs(Workspace:GetChildren()) do
+            if m:IsA("Model")
+                and m ~= ownFolder
+                and m:GetAttribute("UnitRealName")
+                and not m:FindFirstChild("Stats") then
+                return m
+            end
+        end
+        return nil
+    end
+
+    -- CFrame to send to server: mouse world-hit + ghost rotation
+    local function paMouseCF()
+        local hit = raycastMouse()
+        if not hit then return nil end
+        local ghost = findHoldingGhost()
+        if ghost and ghost.PrimaryPart then
+            local gCF = ghost.PrimaryPart.CFrame
+            local rot = gCF - gCF.Position
+            return CFrame.new(hit.Position) * rot
+        end
+        return hit
+    end
+    -- Register callback the namecall hook reads via getgenv()
+    getgenv()._ARMouseCFFn = paMouseCF
+
+    sec.MiscR:Toggle({
+        Name = "Enable Place Anywhere",
+        Default = false,
+        Callback = function(v)
+            _AR.PlaceAnywhereEnabled = v
+            getgenv()._ARPlaceAnywhereEnabled = v
+            if _AR._refreshHookActive then _AR._refreshHookActive() end
+            dbg("[PA] toggle = " .. tostring(v))
+            Notify(v and "Place Anywhere ON" or "Place Anywhere OFF", 2)
+        end,
+    }, "PlaceAnywhere")
+
+    -- Diagnostic: force-place RIGHT NOW at mouse position, without waiting
+    -- for LMB or the game to fire. Use when normal click path doesn't work,
+    -- to isolate the cause (ghost-detection vs LMB listener vs hook bypass).
+    sec.MiscR:Button({
+        Name = "🧪 Force Place at Mouse Now",
+        Callback = function()
+            local ghost = findHoldingGhost()
+            if not ghost then
+                Notify("No ghost in workspace — grab a unit first", 4)
+                return
+            end
+            local uuid = ghost:GetAttribute("UnitRealName")
+            if not uuid or uuid == "" then
+                Notify("Ghost has no UnitRealName attribute", 4)
+                return
+            end
+            local cf = paMouseCF()
+            if not cf then Notify("No raycast hit", 3) return end
+            local remote = Remotes:FindFirstChild("CreateUnits")
+            if not remote then
+                Notify("CreateUnits not available (lobby?)", 3)
+                return
+            end
+            safe(function() remote:FireServer(uuid, cf) end)
+            Notify(("Fired CreateUnits(%s) at mouse"):format(uuid:sub(1, 12)), 3)
+        end,
+    })
+
+    -- Resolve CreateUnits remote once (may be absent on lobby)
+    local createUnitsRemote = Remotes:FindFirstChild("CreateUnits")
+
+    -- LMB listener: toggle ON + holding ghost + game didn't fire within
+    -- 80ms → force-fire ourselves. In valid zones the game fires its own
+    -- CreateUnits (hook already overrides CF), bumping _ARLastCreateUnitsFire
+    -- so we skip force-fire and avoid double placement.
+    --
+    -- NB: we intentionally do NOT check `processed` — when you hold a ghost
+    -- and click a team slot button, processed=true but that's not a world
+    -- click. Instead we gate on findHoldingGhost() which only returns
+    -- something when a ghost is in flight.
+    local paInputConn = UserInputService.InputBegan:Connect(function(input)
+        if input.UserInputType ~= Enum.UserInputType.MouseButton1 then return end
+        if not _AR.PlaceAnywhereEnabled then return end
+
+        local ghost = findHoldingGhost()
+        if not ghost then return end
+        local uuid = ghost:GetAttribute("UnitRealName")
+        if not uuid or uuid == "" then
+            dbg("[PA] ghost has no UnitRealName attribute")
+            return
+        end
+
+        dbg(("[PA] click detected, ghost uuid=%s, waiting for game fire..."):format(uuid))
+
+        task.delay(0.08, function()
+            if not getgenv()._ARRunning then return end
+            if not _AR.PlaceAnywhereEnabled then return end
+            local last = getgenv()._ARLastCreateUnitsFire or 0
+            local sinceFire = tick() - last
+            if sinceFire > 0.1 then
+                -- Game didn't fire — invalid zone. Force-fire ourselves.
+                local cf = paMouseCF()
+                if not cf then
+                    dbg("[PA] no raycast hit, skipping")
+                    return
+                end
+                if not createUnitsRemote then
+                    dbg("[PA] CreateUnits remote not found (lobby server?)")
+                    return
+                end
+                dbg(("[PA] force-firing CreateUnits for %s"):format(uuid))
+                safe(function() createUnitsRemote:FireServer(uuid, cf) end)
+            else
+                dbg(("[PA] game already fired %.3fs ago, skip"):format(sinceFire))
+            end
+        end)
+    end)
+    table.insert(_cleanupConns, paInputConn)
+end)
+if not _ok_misc then warn("[ApelHub] MISC tab failed: " .. tostring(_err_misc)) end
+
+-- ════════════════════════════════════════════════════════════════
+-- SETTINGS TAB
+-- ════════════════════════════════════════════════════════════════
+local _ok_settings, _err_settings = pcall(function()
+    sec.SetL:Header({ Text = "Webhook" })
+    sec.SetL:Input({
+        Name = "Discord Webhook URL",
+        Default = "",
+        Placeholder = "https://discord.com/api/webhooks/...",
+        Callback = function(v) _AR.WebhookURL = v end,
+    }, "WebhookURL")
+    sec.SetL:Input({
+        Name = "Discord User ID (ping)",
+        Default = "",
+        Placeholder = "123456789012345678",
+        Callback = function(v) _AR.WebhookDiscordUserId = v end,
+    }, "WebhookUserId")
+    sec.SetL:Toggle({
+        Name = "Webhook on SECRET",
+        Default = true,
+        Callback = function(v) _AR.WebhookOnSecret = v end,
+    }, "WebhookSecret")
+    sec.SetL:Toggle({
+        Name = "Webhook on MYTHIC",
+        Default = false,
+        Callback = function(v) _AR.WebhookOnMythic = v end,
+    }, "WebhookMythic")
+    sec.SetL:Button({
+        Name = "Test webhook",
+        Callback = function()
+            if _AR.WebhookURL == "" then Notify("Set URL first", 3) return end
+            sendWebhook("Test", "Apel Hub webhook is working ✅", 5763719)
+            Notify("Sent test", 2)
+        end,
+    })
+
+    -- ───────────────────────────────────────────────────────────────
+    -- Server-side game settings. These map to data.Setting.* and are
+    -- toggled via Remotes.Setting:FireServer(name, <subkey|value>, <value|nil>).
+    -- They are the GAME's own auto features — preferred over hub-implemented
+    -- equivalents because they run server-side with no client load.
+    -- ───────────────────────────────────────────────────────────────
+    sec.SetL:Divider()
+    sec.SetL:Header({ Text = "Server Auto (in-game settings)" })
+    sec.SetL:Paragraph({
+        Header = "Info",
+        Body = "These are the GAME's own auto-features (not hub logic). They "
+            .. "run server-side and persist across sessions. Syncs current "
+            .. "values from your profile on load.",
+    })
+
+    local function fireSetting(name, a, b)
+        safe(function()
+            local s = Remotes:FindFirstChild("Setting")
+            if s then s:FireServer(name, a, b) end
+        end)
+    end
+
+    -- Read current values from client data (loaded above)
+    local function readSettingBool(name, subkey)
+        local d = getClientData()
+        if not (d and type(d.Setting) == "table") then return false end
+        if subkey then
+            local sub = d.Setting[name]
+            return type(sub) == "table" and sub[subkey] == true
+        end
+        return d.Setting[name] == true
+    end
+
+    sec.SetL:Toggle({
+        Name = "Auto Game Start",
+        Default = readSettingBool("AutoGameStart"),
+        Callback = function(v) fireSetting("AutoGameStart", v) end,
+    }, "Srv_AutoGameStart")
+    sec.SetL:Toggle({
+        Name = "Auto Replay (on match end)",
+        Default = readSettingBool("AutoReplay"),
+        Callback = function(v) fireSetting("AutoReplay", v) end,
+    }, "Srv_AutoReplay")
+    sec.SetL:Toggle({
+        Name = "Auto Skip Wave",
+        Default = readSettingBool("AutoSkipWave"),
+        Callback = function(v) fireSetting("AutoSkipWave", v) end,
+    }, "Srv_AutoSkipWave")
+
+    if not _AR.IsGameplayServer then
+        sec.SetL:Divider()
+        sec.SetL:Header({ Text = "Server Auto Sell (destructive!)" })
+        sec.SetL:Paragraph({
+            Header = "⚠ Note",
+            Body = "In-game auto-sell PERMANENTLY deletes units as they drop, "
+                .. "by rarity × shiny matrix. Takes effect next summon.",
+        })
+        local SELL_MATRIX = {
+            { key = "RareNormal",   label = "Rare (Normal)"    },
+            { key = "RareShiny",    label = "Rare ⭐ Shiny"    },
+            { key = "EpicNormal",   label = "Epic (Normal)"    },
+            { key = "EpicShiny",    label = "Epic ⭐ Shiny"    },
+            { key = "LegendNormal", label = "Legend (Normal)"  },
+            { key = "LegendShiny",  label = "Legend ⭐ Shiny"  },
+        }
+        for _, entry in ipairs(SELL_MATRIX) do
+            sec.SetL:Toggle({
+                Name = "AutoSell · " .. entry.label,
+                Default = readSettingBool("AutoSell", entry.key),
+                Callback = function(v) fireSetting("AutoSell", entry.key, v) end,
+            }, "Srv_AutoSell_" .. entry.key)
+        end
+    end
+
+    sec.SetR:Header({ Text = "UI" })
+    sec.SetR:Button({
+        Name = "Unload Hub",
+        Callback = function()
+            getgenv()._ARRunning = false
+            if getgenv()._ARCleanup then pcall(getgenv()._ARCleanup) end
+            if getgenv()._ARUI then pcall(function() getgenv()._ARUI:Unload() end) end
+            Notify("Unloaded. Rerun to reopen.", 3)
+        end,
+    })
+    sec.SetR:Paragraph({
+        Header = "About",
+        Body = "Apel Hub · Anime Reversal\nBuilt with MacLib\nConfigs auto-saved per-place.",
+    })
+    sec.SetR:Paragraph({
+        Header = "Hotkeys",
+        Body = "Left Ctrl — toggle UI\nDrag title bar to move",
+    })
+end)
+if not _ok_settings then warn("[ApelHub] SETTINGS tab setup failed: " .. tostring(_err_settings)) print("[ApelHub] SETTINGS:", _err_settings) end
+
+-- ════════════════════════════════════════════════════════════════
+-- FINALIZE: Minimizer + config load + load report
+-- ════════════════════════════════════════════════════════════════
+
+-- Collect pcall results from every wrapped tab for a single summary Notify
+local _tabResults = {
+    SUMMON   = _ok_summon,   UNITS    = _ok_units,    AUTOJOIN = _ok_autojoin,
+    MACROS   = _ok_macros,   SHOPS    = _ok_shops,
+    CLAIMS   = _ok_claims,   EVENTS   = _ok_events,
+    CODES    = _ok_codes,    TELEPORT = _ok_teleport, MISC     = _ok_misc,
+    SETTINGS = _ok_settings,
+}
+local _failed = {}
+for name, ok in pairs(_tabResults) do
+    if ok == false then table.insert(_failed, name) end
+end
+table.sort(_failed)
+
+task.spawn(function()
+    task.wait(0.2)
+    pcall(function()
+        Window:CreateMinimizer({
+            Size = UDim2.fromOffset(50, 50),
+            Position = UDim2.new(1, -10, 0.5, 0),
+            Icon = "rbxassetid://138310609771261",
+        })
+    end)
+end)
+
+task.spawn(function()
+    task.wait(0.5)
+    pcall(function() MacLib:SetFolder("ApelHub") end)
+    pcall(function() MacLib:LoadAutoLoadConfig() end)
+    dbg("Config autoload ran")
+end)
+
+if #_failed > 0 then
+    local msg = "Failed tabs: " .. table.concat(_failed, ", ")
+    warn("[ApelHub] " .. msg)
+    print("[ApelHub] " .. msg)
+    Notify("⚠ " .. msg .. " — check console for details", 8)
+else
+    local okCount = 0
+    for _, ok in pairs(_tabResults) do if ok then okCount = okCount + 1 end end
+    Notify(("Apel Hub loaded · %d tabs OK · %s"):format(
+        okCount, _AR.IsGameplayServer and "GAMEPLAY" or "LOBBY"), 4)
+end
+dbg("Ready")
