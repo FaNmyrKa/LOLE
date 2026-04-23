@@ -1,0 +1,869 @@
+-- Укажи здесь ID нужной игры
+local targetPlaceId = 99449877692519
+
+if game.PlaceId == targetPlaceId then
+    print("✅ ID совпал. Запуск основного скрипта...")
+task.wait(10)
+    
+-- ============================================================
+-- Adonis Bypass 5.0 (Handshake Emulation + Detection Killer)
+-- Made by IdkhubXApelhub
+-- Based on decompiled handshake heartbeat analysis (2026-04-13)
+-- ============================================================
+
+local CHUNK_SIZE = 50
+local TweenService = game:GetService("TweenService")
+local Players = game:GetService("Players")
+local LocalPlayer = Players.LocalPlayer
+local ContentProvider = game:GetService("ContentProvider")
+local HttpService = game:GetService("HttpService")
+local RunService = game:GetService("RunService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+-- Adonis blacklisted asset IDs (from handshake v_u_153 table)
+local BLACKLISTED_ASSETS = {
+    ["4544052033"] = true, -- SaveInstance/Dex marker
+    ["9352453730"]=true,["6065821980"]=true,["6065821086"]=true,["6065821596"]=true,
+    ["6065775281"]=true,["474172996"]=true,["588745174"]=true,["476354004"]=true,
+    ["77048702691728"]=true,["118030257662919"]=true,["10804731440"]=true,
+    ["10137941941"]=true,["11036884234"]=true,["11380036235"]=true,["7445543667"]=true,
+    ["4384403532"]=true,["8834748103"]=true,["7072725342"]=true,["7072719338"]=true,
+    ["4155801252"]=true,["124787561088097"]=true,["97019402877636"]=true,
+    ["1721163816"]=true,["88615350959554"]=true,["105257344115504"]=true,
+    ["112476657475451"]=true,["80999662900595"]=true,["117788349049947"]=true,
+    ["117817408534198"]=true,["75035847706564"]=true,["82909646051652"]=true,
+    ["120245531583106"]=true,["10088146939"]=true,["12785195438"]=true,
+    ["115986292591138"]=true,["10709811706"]=true,["123075575905080"]=true,
+    ["95520539453874"]=true,["116198788221242"]=true,["84528813312016"]=true,
+    ["73070135088117"]=true,["128426502701541"]=true,["73034596791310"]=true,
+    ["83827110621355"]=true,
+}
+
+-- ─── UI COMPONENTS ───────────────────────────────────────────
+local function createLoadingUI()
+    local screenGui = Instance.new("ScreenGui")
+    screenGui.Name = "Adonis Bypass 4.0"
+    screenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+    screenGui.ResetOnSpawn = false
+    screenGui.Parent = game:GetService("CoreGui")
+
+    local backgroundFrame = Instance.new("Frame")
+    backgroundFrame.Name = "Background"
+    backgroundFrame.Size = UDim2.new(1, 0, 1, 0)
+    backgroundFrame.BackgroundColor3 = Color3.fromRGB(0, 0, 0)
+    backgroundFrame.BackgroundTransparency = 0.7
+    backgroundFrame.BorderSizePixel = 0
+    backgroundFrame.Parent = screenGui
+
+    local mainFrame = Instance.new("Frame")
+    mainFrame.Name = "MainContainer"
+    mainFrame.Size = UDim2.new(0, 420, 0, 220)
+    mainFrame.Position = UDim2.new(0.5, -210, 0.5, -110)
+    mainFrame.BackgroundColor3 = Color3.fromRGB(20, 20, 28)
+    mainFrame.BackgroundTransparency = 0.05
+    mainFrame.BorderSizePixel = 0
+    mainFrame.ClipsDescendants = true
+    mainFrame.Parent = screenGui
+
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = UDim.new(0, 10)
+    corner.Parent = mainFrame
+
+    local shadow = Instance.new("UIStroke")
+    shadow.Color = Color3.fromRGB(80, 40, 120)
+    shadow.Thickness = 2
+    shadow.Parent = mainFrame
+
+    local title = Instance.new("TextLabel")
+    title.Name = "Title"
+    title.Size = UDim2.new(1, 0, 0, 40)
+    title.Position = UDim2.new(0, 0, 0, 10)
+    title.BackgroundTransparency = 1
+    title.Text = "Adonis Bypass 5.0"
+    title.TextColor3 = Color3.fromRGB(120, 80, 255)
+    title.TextScaled = true
+    title.Font = Enum.Font.GothamBold
+    title.Parent = mainFrame
+
+    local statusText = Instance.new("TextLabel")
+    statusText.Name = "StatusText"
+    statusText.Size = UDim2.new(1, -40, 0, 30)
+    statusText.Position = UDim2.new(0, 20, 0, 60)
+    statusText.BackgroundTransparency = 1
+    statusText.Text = "Initializing..."
+    statusText.TextColor3 = Color3.fromRGB(255, 255, 255)
+    statusText.TextScaled = true
+    statusText.Font = Enum.Font.Gotham
+    statusText.TextXAlignment = Enum.TextXAlignment.Left
+    statusText.Parent = mainFrame
+
+    local loadingBarBg = Instance.new("Frame")
+    loadingBarBg.Name = "LoadingBarBackground"
+    loadingBarBg.Size = UDim2.new(1, -40, 0, 20)
+    loadingBarBg.Position = UDim2.new(0, 20, 0, 105)
+    loadingBarBg.BackgroundColor3 = Color3.fromRGB(40, 40, 50)
+    loadingBarBg.BorderSizePixel = 0
+    loadingBarBg.Parent = mainFrame
+
+    local loadingBarBgCorner = Instance.new("UICorner")
+    loadingBarBgCorner.CornerRadius = UDim.new(0, 4)
+    loadingBarBgCorner.Parent = loadingBarBg
+
+    local loadingBar = Instance.new("Frame")
+    loadingBar.Name = "LoadingBar"
+    loadingBar.Size = UDim2.new(0, 0, 1, 0)
+    loadingBar.BackgroundColor3 = Color3.fromRGB(120, 80, 255)
+    loadingBar.BorderSizePixel = 0
+    loadingBar.Parent = loadingBarBg
+
+    local loadingBarCorner = Instance.new("UICorner")
+    loadingBarCorner.CornerRadius = UDim.new(0, 4)
+    loadingBarCorner.Parent = loadingBar
+
+    local percentageText = Instance.new("TextLabel")
+    percentageText.Name = "PercentageText"
+    percentageText.Size = UDim2.new(1, -40, 0, 20)
+    percentageText.Position = UDim2.new(0, 20, 0, 130)
+    percentageText.BackgroundTransparency = 1
+    percentageText.Text = "0%"
+    percentageText.TextColor3 = Color3.fromRGB(200, 200, 200)
+    percentageText.TextScaled = true
+    percentageText.Font = Enum.Font.Gotham
+    percentageText.Parent = mainFrame
+
+    local footerText = Instance.new("TextLabel")
+    footerText.Name = "FooterText"
+    footerText.Size = UDim2.new(1, -40, 0, 20)
+    footerText.Position = UDim2.new(0, 20, 0, 175)
+    footerText.BackgroundTransparency = 1
+    footerText.Text = "Deep analysis bypass — powered by IdkhubXApelhub"
+    footerText.TextColor3 = Color3.fromRGB(120, 120, 140)
+    footerText.TextScaled = true
+    footerText.Font = Enum.Font.Gotham
+    footerText.Parent = mainFrame
+
+    return screenGui, statusText, loadingBar, percentageText, backgroundFrame, mainFrame
+end
+
+local function updateProgress(statusText, loadingBar, percentageText, progress, message, isLast)
+    statusText.Text = message
+    percentageText.Text = math.floor(progress * 100) .. "%"
+
+    local tween = TweenService:Create(
+        loadingBar,
+        TweenInfo.new(0.4, Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
+        { Size = UDim2.new(progress, 0, 1, 0) }
+    )
+    tween:Play()
+    if isLast then
+        statusText.TextColor3 = Color3.fromRGB(100, 255, 100)
+        percentageText.TextColor3 = Color3.fromRGB(100, 255, 100)
+    end
+    tween.Completed:Wait()
+end
+
+local function startPulse(backgroundFrame)
+    task.spawn(function()
+        local transparency, dir = 0.7, -1
+        while backgroundFrame and backgroundFrame.Parent do
+            transparency = transparency + dir * 0.015
+            if transparency <= 0.5 then dir = 1
+            elseif transparency >= 0.7 then dir = -1 end
+            pcall(function() backgroundFrame.BackgroundTransparency = transparency end)
+            task.wait(0.05)
+        end
+    end)
+end
+
+local function fadeOutAndDestroy(screenGui, backgroundFrame, mainFrame)
+    task.spawn(function()
+        for i = 0, 10 do
+            local alpha = i / 10
+            pcall(function()
+                backgroundFrame.BackgroundTransparency = 0.7 + 0.3 * alpha
+                mainFrame.BackgroundTransparency = 0.05 + 0.95 * alpha
+            end)
+            task.wait(0.05)
+        end
+        pcall(function() screenGui:Destroy() end)
+    end)
+end
+
+local function ShowAdonisBypassNotification()
+    local CoreGUI = game:GetService("CoreGui")
+    if not CoreGUI then return end
+
+    local NotificationGui = Instance.new("ScreenGui")
+    NotificationGui.Name = "AdonisBypassNotification"
+    NotificationGui.Parent = CoreGUI
+    NotificationGui.ResetOnSpawn = false
+    NotificationGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+    NotificationGui.DisplayOrder = 999
+
+    local NotificationFrame = Instance.new("Frame")
+    NotificationFrame.Name = "NotificationFrame"
+    NotificationFrame.Parent = NotificationGui
+    NotificationFrame.BackgroundColor3 = Color3.fromRGB(20, 20, 28)
+    NotificationFrame.BackgroundTransparency = 0.05
+    NotificationFrame.BorderSizePixel = 0
+    NotificationFrame.Position = UDim2.new(0.5, -210, 0, -120)
+    NotificationFrame.Size = UDim2.new(0, 420, 0, 110)
+    NotificationFrame.ClipsDescendants = true
+
+    local Gradient = Instance.new("UIGradient")
+    Gradient.Color = ColorSequence.new({
+        ColorSequenceKeypoint.new(0, Color3.fromRGB(30, 20, 50)),
+        ColorSequenceKeypoint.new(1, Color3.fromRGB(15, 15, 22))
+    })
+    Gradient.Rotation = 90
+    Gradient.Parent = NotificationFrame
+
+    local UICorner = Instance.new("UICorner")
+    UICorner.CornerRadius = UDim.new(0, 10)
+    UICorner.Parent = NotificationFrame
+
+    local Stroke = Instance.new("UIStroke")
+    Stroke.Color = Color3.fromRGB(120, 80, 255)
+    Stroke.Thickness = 1.5
+    Stroke.Parent = NotificationFrame
+
+    local TitleLabel = Instance.new("TextLabel")
+    TitleLabel.Name = "TitleLabel"
+    TitleLabel.Parent = NotificationFrame
+    TitleLabel.BackgroundTransparency = 1
+    TitleLabel.Position = UDim2.new(0, 15, 0, 12)
+    TitleLabel.Size = UDim2.new(1, -30, 0, 28)
+    TitleLabel.Font = Enum.Font.GothamBold
+    TitleLabel.Text = "⚡ Adonis Anti-Cheat bypassed (v5.0)"
+    TitleLabel.TextColor3 = Color3.fromRGB(120, 80, 255)
+    TitleLabel.TextSize = 18
+    TitleLabel.TextXAlignment = Enum.TextXAlignment.Left
+
+    local BodyLabel = Instance.new("TextLabel")
+    BodyLabel.Name = "BodyLabel"
+    BodyLabel.Parent = NotificationFrame
+    BodyLabel.BackgroundTransparency = 1
+    BodyLabel.Position = UDim2.new(0, 15, 0, 42)
+    BodyLabel.Size = UDim2.new(1, -30, 0, 22)
+    BodyLabel.Font = Enum.Font.Gotham
+    BodyLabel.Text = "Full detection killer + Handshake emulator active"
+    BodyLabel.TextColor3 = Color3.fromRGB(200, 200, 210)
+    BodyLabel.TextSize = 13
+    BodyLabel.TextXAlignment = Enum.TextXAlignment.Left
+
+    local FooterLabel = Instance.new("TextLabel")
+    FooterLabel.Name = "FooterLabel"
+    FooterLabel.Parent = NotificationFrame
+    FooterLabel.BackgroundTransparency = 1
+    FooterLabel.Position = UDim2.new(0, 15, 0, 78)
+    FooterLabel.Size = UDim2.new(1, -30, 0, 20)
+    FooterLabel.Font = Enum.Font.Gotham
+    FooterLabel.Text = "Made by IdkhubXApelhub"
+    FooterLabel.TextColor3 = Color3.fromRGB(120, 120, 180)
+    FooterLabel.TextSize = 12
+    FooterLabel.TextXAlignment = Enum.TextXAlignment.Left
+
+    local CloseButton = Instance.new("ImageButton")
+    CloseButton.Name = "CloseButton"
+    CloseButton.Parent = NotificationFrame
+    CloseButton.BackgroundTransparency = 1
+    CloseButton.Position = UDim2.new(1, -40, 0, 10)
+    CloseButton.Size = UDim2.new(0, 30, 0, 30)
+    CloseButton.Image = "rbxassetid://6031280882"
+    CloseButton.ImageColor3 = Color3.fromRGB(255, 100, 100)
+
+    CloseButton.MouseButton1Click:Connect(function()
+        NotificationGui:Destroy()
+    end)
+
+    NotificationFrame:TweenPosition(
+        UDim2.new(0.5, -210, 0.05, 0),
+        Enum.EasingDirection.Out,
+        Enum.EasingStyle.Back,
+        0.5,
+        true
+    )
+
+    task.delay(6, function()
+        if not NotificationGui.Parent then return end
+        NotificationFrame:TweenPosition(
+            UDim2.new(0.5, -210, 0, -120),
+            Enum.EasingDirection.In,
+            Enum.EasingStyle.Quad,
+            0.3,
+            true
+        )
+        task.wait(0.35)
+        pcall(function() NotificationGui:Destroy() end)
+    end)
+end
+
+-- ─── BYPASS NOTIFIER ────────────────────────────────────────────
+local notifyStack = 0
+
+local function BypassNotify(detail)
+    notifyStack = notifyStack + 1
+    local myIndex = notifyStack
+
+    task.spawn(function()
+        local CoreGUI = game:GetService("CoreGui")
+        if not CoreGUI then return end
+
+        local Gui = Instance.new("ScreenGui")
+        Gui.Name = "BypassNotify_" .. tostring(tick())
+        Gui.ResetOnSpawn = false
+        Gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+        Gui.DisplayOrder = 1000 + myIndex
+        Gui.Parent = CoreGUI
+
+        local yOffset = 10 + (myIndex - 1) * 75
+
+        local Frame = Instance.new("Frame")
+        Frame.Name = "NotifyFrame"
+        Frame.Parent = Gui
+        Frame.BackgroundColor3 = Color3.fromRGB(20, 18, 30)
+        Frame.BackgroundTransparency = 0.05
+        Frame.BorderSizePixel = 0
+        Frame.Position = UDim2.new(1, 0, 0, yOffset)
+        Frame.Size = UDim2.new(0, 460, 0, 65)
+        Frame.ClipsDescendants = true
+
+        local Corner = Instance.new("UICorner")
+        Corner.CornerRadius = UDim.new(0, 6)
+        Corner.Parent = Frame
+
+        local Stroke = Instance.new("UIStroke")
+        Stroke.Color = Color3.fromRGB(255, 50, 50)
+        Stroke.Thickness = 1.5
+        Stroke.Transparency = 0.2
+        Stroke.Parent = Frame
+
+        local Accent = Instance.new("Frame")
+        Accent.Name = "Accent"
+        Accent.Parent = Frame
+        Accent.BackgroundColor3 = Color3.fromRGB(255, 40, 40)
+        Accent.BorderSizePixel = 0
+        Accent.Position = UDim2.new(0, 0, 0, 0)
+        Accent.Size = UDim2.new(0, 4, 1, 0)
+
+        local XIcon = Instance.new("TextLabel")
+        XIcon.Name = "XIcon"
+        XIcon.Parent = Frame
+        XIcon.BackgroundTransparency = 1
+        XIcon.Position = UDim2.new(0, 10, 0, 8)
+        XIcon.Size = UDim2.new(0, 28, 0, 28)
+        XIcon.Font = Enum.Font.GothamBold
+        XIcon.Text = "❌"
+        XIcon.TextColor3 = Color3.fromRGB(255, 50, 50)
+        XIcon.TextSize = 20
+
+        task.spawn(function()
+            while XIcon and XIcon.Parent do
+                TweenService:Create(XIcon, TweenInfo.new(0.5, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut), {
+                    TextColor3 = Color3.fromRGB(255, 120, 120)
+                }):Play()
+                task.wait(0.5)
+                if not XIcon or not XIcon.Parent then break end
+                TweenService:Create(XIcon, TweenInfo.new(0.5, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut), {
+                    TextColor3 = Color3.fromRGB(255, 40, 40)
+                }):Play()
+                task.wait(0.5)
+            end
+        end)
+
+        local Title = Instance.new("TextLabel")
+        Title.Name = "Title"
+        Title.Parent = Frame
+        Title.BackgroundTransparency = 1
+        Title.Position = UDim2.new(0, 42, 0, 6)
+        Title.Size = UDim2.new(1, -50, 0, 22)
+        Title.Font = Enum.Font.GothamBold
+        Title.Text = "Adonis detection blocked! (v5.0)"
+        Title.TextColor3 = Color3.fromRGB(255, 90, 90)
+        Title.TextSize = 14
+        Title.TextXAlignment = Enum.TextXAlignment.Left
+
+        local Detail = Instance.new("TextLabel")
+        Detail.Name = "Detail"
+        Detail.Parent = Frame
+        Detail.BackgroundTransparency = 1
+        Detail.Position = UDim2.new(0, 42, 0, 32)
+        Detail.Size = UDim2.new(1, -50, 0, 22)
+        Detail.Font = Enum.Font.Gotham
+        Detail.Text = detail or ""
+        Detail.TextColor3 = Color3.fromRGB(200, 200, 200)
+        Detail.TextSize = 11
+        Detail.TextXAlignment = Enum.TextXAlignment.Left
+        Detail.TextTruncate = Enum.TextTruncate.AtEnd
+
+        Frame:TweenPosition(
+            UDim2.new(1, -470, 0, yOffset),
+            Enum.EasingDirection.Out,
+            Enum.EasingStyle.Quad,
+            0.35,
+            true
+        )
+
+        task.delay(4, function()
+            if not Gui.Parent then return end
+            Frame:TweenPosition(
+                UDim2.new(1, 0, 0, yOffset),
+                Enum.EasingDirection.In,
+                Enum.EasingStyle.Quad,
+                0.3,
+                true
+            )
+            task.wait(0.35)
+            pcall(function() Gui:Destroy() end)
+            notifyStack = math.max(0, notifyStack - 1)
+        end)
+    end)
+end
+
+-- ─── HELPERS ────────────────────────────────────────────────────
+local function chunkedIterate(tbl, callback)
+    local i = 0
+    for _, v in tbl do
+        callback(v)
+        i = i + 1
+        if i % CHUNK_SIZE == 0 then
+            task.wait()
+        end
+    end
+end
+
+local function serializeArg(arg, depth)
+    depth = depth or 0
+    if depth > 2 then return "[...]" end
+    if type(arg) == "table" then
+        local parts = {}
+        local count = 0
+        for k, v in pairs(arg) do
+            count = count + 1
+            if count > 6 then table.insert(parts, "...") break end
+            table.insert(parts, tostring(k) .. "=" .. serializeArg(v, depth + 1))
+        end
+        return "{" .. table.concat(parts, ", ") .. "}"
+    elseif type(arg) == "string" then
+        return '"' .. arg:sub(1, 80) .. '"'
+    else
+        return tostring(arg)
+    end
+end
+
+local function serializeArgs(args)
+    local parts = {}
+    for i, arg in ipairs(args) do
+        table.insert(parts, string.format("[%d] %s (%s)", i, serializeArg(arg), type(arg)))
+    end
+    return table.concat(parts, " | ")
+end
+
+-- ═══════════════════════════════════════════════════════════════
+-- MASTER BYPASS ENGINE v5.0
+-- ═══════════════════════════════════════════════════════════════
+local function BypassAnticheats()
+    local AnticheatData = { Disabled = false, Name = "N/A" }
+    local GeneralPurposeBypasses = {}
+    local Adonis = { Name = "Adonis", Game = "*" }
+
+    function Adonis.Detect()
+        if not getreg or not getgc or not isfunctionhooked then return false end
+        return true
+    end
+
+    function Adonis.Bypass()
+        local hooked = 0
+        local hookLog = {}
+        local function logHook(name, source)
+            hooked = hooked + 1
+            table.insert(hookLog, name)
+            print(string.format("[Bypass] ✓ Hooked: %s (source: %s) [total: %d]", name, source or "?", hooked))
+        end
+
+        -- ═══════════════════════════════════════════════════════
+        -- PHASE 1: GC TABLE SCAN — Anti, Remote, Client
+        -- ═══════════════════════════════════════════════════════
+        chunkedIterate(getgc(true), function(obj)
+            if type(obj) ~= "table" then return end
+
+            -- ─── ANTI TABLE ───
+            local hasDetected = rawget(obj, "Detected")
+            local hasRLocked = rawget(obj, "RLocked")
+            local hasLaunch = rawget(obj, "Launch")
+            if hasDetected and hasRLocked and hasLaunch and typeof(hasDetected) == "function" then
+                if not isfunctionhooked(obj.Detected) then
+                    local ogDetected = clonefunction(obj.Detected)
+                    pcall(hookfunction, obj.Detected, function(action, info, isLocal)
+                        if action == "_" and info == "_" and isLocal == true then
+                            return ogDetected(action, info, isLocal)
+                        end
+                        local detail = string.format("Blocked Detected() → '%s' | '%s' | %s",
+                            tostring(action), tostring(info),
+                            (action=="kick" and "KICK") or (action=="crash" and "CRASH") or (action=="ban" and "BAN") or "UNKNOWN")
+                        warn("[Bypass] " .. detail); BypassNotify(detail)
+                        return true
+                    end)
+                    logHook("Anti.Detected", "GC table")
+                end
+                for _, kn in ipairs({"RLocked","Launch","Init","RunAfterLoaded","RunLast","AddDetector"}) do
+                    local fn = rawget(obj, kn)
+                    if fn and typeof(fn) == "function" and not isfunctionhooked(fn) then
+                        if kn == "RLocked" then
+                            pcall(hookfunction, fn, function() return false end)
+                        else
+                            pcall(hookfunction, fn, function(...)
+                                local d = "Blocked Anti."..kn.."()"
+                                warn("[Bypass] "..d); BypassNotify(d); return
+                            end)
+                        end
+                        logHook("Anti."..kn, "GC table")
+                    end
+                end
+            end
+
+            -- ─── REMOTE TABLE (Commands + Returnables) ───
+            local hasSend = rawget(obj, "Send")
+            local hasGet = rawget(obj, "Get")
+            local hasFire = rawget(obj, "Fire")
+            if hasSend and hasGet and hasFire and typeof(hasSend) == "function" then
+                local hasCommands = rawget(obj, "Commands")
+                if hasCommands and type(hasCommands) == "table" then
+                    for _, cn in ipairs({"LaunchAnti","Disconnect","Kill","Crash","Ban"}) do
+                        local cfn = rawget(hasCommands, cn)
+                        if cfn and typeof(cfn) == "function" and not isfunctionhooked(cfn) then
+                            pcall(hookfunction, cfn, function(...)
+                                local d = "Blocked Commands."..cn.."()"
+                                warn("[Bypass] "..d); BypassNotify(d); return
+                            end)
+                            logHook("Commands."..cn, "Remote.Commands")
+                        end
+                    end
+                    local lc = rawget(hasCommands, "LoadCode")
+                    if lc and typeof(lc) == "function" and not isfunctionhooked(lc) then
+                        local ogLC = clonefunction(lc)
+                        pcall(hookfunction, lc, function(data, ...)
+                            if type(data) == "table" then
+                                for _, v in pairs(data) do
+                                    local vs = tostring(v):lower()
+                                    if vs:find("detect") or vs:find("kick") or vs:find("crash") or vs:find("ban") then
+                                        BypassNotify("Blocked Commands.LoadCode (suspicious)"); return
+                                    end
+                                end
+                            end
+                            return ogLC(data, ...)
+                        end)
+                        logHook("Commands.LoadCode", "Remote.Commands")
+                    end
+                end
+                local hasRet = rawget(obj, "Returnables")
+                if hasRet and type(hasRet) == "table" then
+                    local ch = rawget(hasRet, "ClientHooked")
+                    if ch and typeof(ch) == "function" and not isfunctionhooked(ch) then
+                        local ogCH = clonefunction(ch)
+                        pcall(hookfunction, ch, function(...)
+                            local ok, r = pcall(ogCH, ...); return ok and r or nil
+                        end)
+                        logHook("Returnables.ClientHooked", "Remote.Returnables")
+                    end
+                end
+            end
+        end)
+
+        -- ═══════════════════════════════════════════════════════
+        -- PHASE 4: GC FUNCTION SCAN
+        -- ═══════════════════════════════════════════════════════
+        chunkedIterate(getgc(false), function(obj)
+            if type(obj) ~= "function" or isfunctionhooked(obj) then return end
+            local ok, info = pcall(debug.info, obj, "n"); if not ok then return end
+            local targets = {Detected=1,Launch=1,Kill=1,Crash=1,HardCrash=1,Ban=1,kick=1,
+                islclosure=1,CheckMetatable=1,Init=1,RunAfterLoaded=1,RunLast=1,AddDetector=1}
+            if not targets[info] then return end
+            local ok2, src = pcall(debug.info, obj, "s"); if not ok2 then return end
+            if not (src:find("Client%.Core") or src:find("Adonis") or src:lower():find("anti")) then return end
+            if info == "Detected" then
+                local og
+                pcall(function()
+                    og = hookfunction(obj, function(a,d,l)
+                        if a=="_" and d=="_" and l==true then return og(a,d,l) end
+                        BypassNotify("Blocked GC Detected()→"..tostring(a)); return true
+                    end)
+                end)
+            else
+                local og
+                pcall(function()
+                    og = hookfunction(obj, function(...)
+                        BypassNotify("Blocked GC '"..info.."()'"); return
+                    end)
+                end)
+            end
+            logHook("GC:"..info, src)
+        end)
+
+        -- ═══════════════════════════════════════════════════════
+        -- PHASE 5: NETWORK HOOK (__namecall)
+        -- ═══════════════════════════════════════════════════════
+        local oldNamecall
+        oldNamecall = hookmetamethod(game, "__namecall", function(self, ...)
+            local args = {...}
+            local method = getnamecallmethod()
+            -- Spy-detection silencer
+            if (method == "FireServer" or method == "InvokeServer")
+                and (self.ClassName == "RemoteEvent" or self.ClassName == "RemoteFunction") then
+                for _, arg in ipairs(args) do
+                    if type(arg) == "string" then
+                        local sl = arg:lower()
+                        if sl:find("remotespy") or sl:find("checkspy") or sl:find("isspy")
+                            or sl:find("spycheck") or sl:find("hookdetect") then
+                            return
+                        end
+                    elseif type(arg) == "table" then
+                        local mode = rawget(arg,"Mode") or rawget(arg,"mode")
+                        if type(mode)=="string" then
+                            local ml = mode:lower()
+                            if ml=="checkspy" or ml=="isspy" or ml=="spycheck" or ml=="hookdetect" or ml=="remotespy" then return end
+                        end
+                    end
+                end
+            end
+            -- Sniffer + spy callback
+            if (method == "FireServer" or method == "InvokeServer")
+                and (self.ClassName == "RemoteEvent" or self.ClassName == "RemoteFunction") then
+                local rn = ""; pcall(function() rn = self.Name end)
+                local rp = ""; pcall(function() rp = self:GetFullName() end)
+                local isA, why = false, ""
+                if rn:lower():find("adonis") or rp:lower():find("adonis") then isA=true; why="name" end
+                if rn:match("^%x%x%x%x%x%x%x%x%-%x%x%x%x%-%x%x%x%x%-%x%x%x%x%-%x%x%x%x%x%x%x%x%x%x%x%x$") then isA=true; why="GUID" end
+                local d1 = args[1]
+                if type(d1)=="table" and (d1.Mode=="Fire" or d1.Mode=="Get") then isA=true; why="Mode" end
+                for _,a in ipairs(args) do
+                    if typeof(a)=="buffer" then isA=true; why="buffer" end
+                end
+                if isA then print(string.format("[Sniffer] %s %s:%s() '%s' [%s]", os.date("%H:%M:%S"), self.ClassName, method, rn, why)) end
+                -- Spy callback
+                local spyCb = rawget(getgenv(), "_RSCallback")
+                if spyCb and type(spyCb) == "function" then pcall(spyCb, self, method, args) end
+            end
+            -- Block detection/kick fire signals
+            if (method == "FireServer" or method == "fireServer") and self.ClassName == "RemoteEvent" then
+                local d1 = args[1]
+                if type(d1) == "table" and (d1.Mode == "Fire" or d1.Mode == "Get") then
+                    for _, a in ipairs(args) do
+                        if type(a) == "string" and (a:find("Detected") or a:find("kick") or a:find("ban") or a:find("crash")) then
+                            BypassNotify("BLOCKED detection fire → "..a:sub(1,40)); return
+                        end
+                    end
+                end
+            end
+            return oldNamecall(self, ...)
+        end)
+        logHook("__namecall", "game metatable")
+
+        -- ═══════════════════════════════════════════════════════
+        -- PHASE 6: Player:Kick SELECTIVE BLOCK
+        -- ═══════════════════════════════════════════════════════
+        if not isfunctionhooked(LocalPlayer.Kick) then
+            local origKick = LocalPlayer.Kick
+            hookfunction(LocalPlayer.Kick, function(self, msg)
+                msg = tostring(msg or ""):lower()
+                if self == LocalPlayer and (msg:find("adonis") or msg:find("anti%-cheat") or msg:find("0x")
+                    or msg:find("exploit") or msg:find("cheat")) then
+                    local detail = string.format(
+                        "Blocked Player:Kick() → Message: '%s'",
+                        tostring(msg):sub(1, 100)
+                    )
+                    warn("[Bypass] " .. detail)
+                    BypassNotify(detail)
+                    return
+                end
+                return origKick(self, msg)
+            end)
+            logHook("Player:Kick", "LocalPlayer")
+        end
+
+        -- ═══════════════════════════════════════════════════════
+        -- PHASE 7: MASK SPY HOOKS — isfunctionhooked + getconnections
+        -- Prevents Adonis from detecting our __namecall hook or extra
+        -- listeners added by remote spy tools (Simple Spy, etc.)
+        -- ═══════════════════════════════════════════════════════
+        do
+            -- ── isfunctionhooked masking ─────────────────────────────
+            -- Adonis calls isfunctionhooked(remote.OnClientEvent.callback)
+            -- to detect if a spy has hooked in. We intercept it and return
+            -- false for any function sourced from Adonis/Client modules.
+            local origIsFH = isfunctionhooked
+            local isFH_hooked = false
+            pcall(function()
+                origIsFH = hookfunction(isfunctionhooked, function(f)
+                    if type(f) == "function" then
+                        local ok, src = pcall(debug.info, f, "s")
+                        if ok and type(src) == "string" then
+                            -- Adonis checking its own module functions → lie
+                            if src:find("Client") or src:find("Adonis") or src:find("Remote") then
+                                return false
+                            end
+                        end
+                        -- If Adonis is checking our injected __namecall hook
+                        -- (source will be empty or from exploit), return false
+                        local ok2, src2 = pcall(debug.info, f, "s")
+                        if ok2 and (src2 == nil or src2 == "") then
+                            return false
+                        end
+                    end
+                    return origIsFH(f)
+                end)
+                isFH_hooked = true
+            end)
+            if isFH_hooked then
+                logHook("isfunctionhooked (spy mask)", "Phase 7")
+            end
+
+            -- ── getconnections masking ───────────────────────────────
+            -- Adonis may enumerate connections on its remotes to count
+            -- how many listeners there are (spy adds one extra).
+            -- We filter out connections with no Adonis source.
+            if getconnections then
+                local origGetConn = getconnections
+                local gc_hooked = false
+                pcall(function()
+                    origGetConn = hookfunction(getconnections, function(signal)
+                        local conns = origGetConn(signal)
+                        if type(conns) ~= "table" then return conns end
+                        local clean = {}
+                        for _, c in ipairs(conns) do
+                            local keep = true
+                            pcall(function()
+                                local cf = c.Function
+                                if cf then
+                                    local ok, src = pcall(debug.info, cf, "s")
+                                    -- Drop connections with no/empty source (injected spy)
+                                    if ok and (src == nil or src == "") then
+                                        keep = false
+                                    end
+                                end
+                            end)
+                            if keep then
+                                table.insert(clean, c)
+                            end
+                        end
+                        return clean
+                    end)
+                    gc_hooked = true
+                end)
+                if gc_hooked then
+                    logHook("getconnections (spy mask)", "Phase 7")
+                end
+            end
+        end
+
+        -- ═══════════════════════════════════════════════════════
+        -- PHASE 12: Player:Kick EXPANDED BLOCK (catches ACLI + Adonis patterns)
+        -- ═══════════════════════════════════════════════════════
+        if not isfunctionhooked(LocalPlayer.Kick) then
+            local origKick = LocalPlayer.Kick
+            pcall(function()
+                origKick = hookfunction(LocalPlayer.Kick, function(self, msg)
+                msg = tostring(msg or ""):lower()
+                if self == LocalPlayer and (
+                    msg:find("adonis") or msg:find("anti%-cheat") or msg:find("0x")
+                    or msg:find("exploit") or msg:find("cheat") or msg:find("acli")
+                    or msg:find("integrity") or msg:find("loading error")
+                    or msg:find("locked") or msg:find("check caller")
+                    or msg:find("bad module") or msg:find("proxy meth")
+                    or msg:find("environment") or msg:find("tamper")
+                ) then
+                    local detail = "Blocked Kick → " .. msg:sub(1, 80)
+                    warn("[Bypass] " .. detail); BypassNotify(detail)
+                    return
+                end
+                return origKick(self, msg)
+                end)
+            end)
+            logHook("Player:Kick (expanded)", "Phase 12")
+        end
+
+
+
+        -- ─── SUMMARY ───
+        print("═══════════════════════════════════════════════════")
+        print("[Bypass 5.0] COMPLETE — Total hooks: " .. hooked)
+        print("[Bypass 5.0] Hooked targets:")
+        for i, name in ipairs(hookLog) do
+            print(string.format("  %d. %s", i, name))
+        end
+        print("═══════════════════════════════════════════════════")
+
+        rawset(getgenv(), "_BypassActive", true)
+        return true
+    end
+
+    table.insert(GeneralPurposeBypasses, Adonis)
+
+    for _, Data in GeneralPurposeBypasses do
+        if Data.Detect() then
+            if Data.Bypass() then
+                AnticheatData.Name = Data.Name
+                AnticheatData.Disabled = true
+                if Data.Name == "Adonis" then ShowAdonisBypassNotification() end
+                break
+            end
+        end
+    end
+
+    return AnticheatData
+end
+
+-- ─── MASTER SEQUENCE ──────────────────────────────────────────
+local function executeBypassSequence()
+    local screenGui, statusText, loadingBar, percentageText, backgroundFrame, mainFrame = createLoadingUI()
+    startPulse(backgroundFrame)
+
+    local sequence = {
+        { progress = 0.05, message = "Scanning GC for Anti..." },
+        { progress = 0.15, message = "Phase 1-3: Hooking Anti lifecycle + Commands + Returnables..." },
+        { progress = 0.30, message = "Phase 4: Scanning GC functions (Detected/Kill/Crash/Ban)..." },
+        { progress = 0.42, message = "Phase 5: Installing __namecall hook + sniffer..." },
+        { progress = 0.70, message = "Phase 12: Expanding Player:Kick blocker (Adonis patterns)..." },
+        { progress = 0.90, message = "Phase 13: Masking spy hooks (isfunctionhooked + getconnections)..." },
+        { progress = 1.00, message = "✓ Adonis Bypass — Core hooks loaded" },
+    }
+
+    for i, step in ipairs(sequence) do
+        local isLast = (i == #sequence)
+        updateProgress(statusText, loadingBar, percentageText, step.progress, step.message, isLast)
+
+        if i == 2 then
+            local bypassDone = false
+            task.spawn(function()
+                local ok, result = pcall(BypassAnticheats)
+                if not ok then warn("[Bypass] Error: " .. tostring(result)) end
+                bypassDone = true
+            end)
+            local elapsed = 0
+            while not bypassDone and elapsed < 30 do
+                task.wait(0.1); elapsed = elapsed + 0.1
+            end
+        else
+            task.wait(0.25)
+        end
+    end
+
+    task.wait(1.2)
+    fadeOutAndDestroy(screenGui, backgroundFrame, mainFrame)
+end
+
+executeBypassSequence()
+
+
+    local function MainScript()
+        -- Твой код писать здесь:
+        print("Скрипт успешно запущен!")
+    end
+
+    -- Запуск функции
+    task.spawn(pcall, MainScript)
+
+else
+    -- Сообщение, если ID не совпал (чтобы понимать, почему ничего не произошло)
+    warn("❌ Ошибка: Скрипт предназначен для PlaceId " .. targetPlaceId .. ". Текущий ID: " .. game.PlaceId)
+end
