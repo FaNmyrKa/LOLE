@@ -1,0 +1,25 @@
+repeat
+    task.wait()
+until game:IsLoaded()
+
+print("h")
+
+task.wait(4)
+
+task.spawn(function()
+    while true do
+        local args = {
+            "_JojosMode1"
+        }
+
+        game:GetService("ReplicatedStorage")
+            :WaitForChild("endpoints")
+            :WaitForChild("client_to_server")
+            :WaitForChild("request_reset_dungeon")
+            :InvokeServer(unpack(args))
+
+        task.wait(1)
+    end
+end)
+
+task.wait(4)
