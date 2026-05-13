@@ -4,7 +4,6 @@ until game:IsLoaded()
 
 print("h")
 
-
 task.wait(4)
 
 task.spawn(function()
@@ -24,5 +23,3 @@ task.spawn(function()
 end)
 
 task.wait(4)
-
-[script]
