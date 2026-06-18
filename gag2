@@ -786,11 +786,25 @@ function droppedItems(nameSubstr)
     local out = {}
     local folder = Workspace:FindFirstChild("DroppedItems")
     if not folder then return out end
+    local needle = string.lower(nameSubstr or "")
     for _, d in ipairs(folder:GetChildren()) do
-        if (not nameSubstr) or string.find(string.lower(d.Name), string.lower(nameSubstr), 1, true) then
+        -- match against ItemCategory (reliable) + DisplayName/ItemName/Name; "Seed" catches gold/rainbow variants
+        local match = (nameSubstr == nil)
+        if not match then
+            for _, src in ipairs({ d:GetAttribute("ItemCategory"), d:GetAttribute("DisplayName"), d:GetAttribute("ItemName"), d.Name }) do
+                if src and string.find(string.lower(tostring(src)), needle, 1, true) then match = true; break end
+            end
+        end
+        -- owner-restricted drops can only be picked up by whoever dropped them
+        if match and d:GetAttribute("OwnerRestricted") == true and d:GetAttribute("DroppedBy") ~= LocalPlayer.UserId then
+            match = false
+        end
+        if match then
+            local anchor = d:FindFirstChild("PromptAnchor")
+            local prompt = (anchor and anchor:FindFirstChild("PickupPrompt")) or d:FindFirstChildWhichIsA("ProximityPrompt", true)
             local ok, piv = pcall(function() return d:GetPivot().Position end)
             local pos = ok and piv or (d:IsA("BasePart") and d.Position)
-            if pos then out[#out + 1] = { inst = d, pos = pos } end
+            if pos then out[#out + 1] = { inst = d, pos = pos, prompt = prompt } end
         end
     end
     return out
@@ -802,6 +816,10 @@ fireCD = (function()
     local g = (getgenv and getgenv()) or {}
     return rawget(g, "fireclickdetector") or fireclickdetector
 end)()
+fireProx = (function()
+    local g = (getgenv and getgenv()) or {}
+    return rawget(g, "fireproximityprompt") or fireproximityprompt
+end)()
 local function eventSeedTypeOf(node)
     while node and node ~= Workspace do
         if node:GetAttribute("GoldSeed") == true then return "Gold" end
@@ -812,43 +830,54 @@ local function eventSeedTypeOf(node)
 end
 function collectMapSeeds()
     local map = Workspace:FindFirstChild("Map")
-    -- owner fix: spawned seed packs (Shooting Star: Rainbow/Gold/normal) carry a "SeedPack" id
-    -- and are claimed via the ClickPack remote (teleport-then-claim). Type filter (Gold/Rainbow) kept.
-    local client = map and map:FindFirstChild("SeedPackSpawnClient")
-    if client then
-        for _, sp in ipairs(client:GetChildren()) do
-            local id = sp:GetAttribute("SeedPack")
-            if id then
-                local passes = true
-                if #selectedEventSeedTypes > 0 then
-                    local ty = eventSeedTypeOf(sp)
-                    if ty and not inSet(selectedEventSeedTypes, ty) then passes = false end
-                end
-                if passes then
+    if not map then return end
+    local function typeOk(obj)
+        if #selectedEventSeedTypes == 0 then return true end
+        local ty = eventSeedTypeOf(obj)
+        return (not ty) or inSet(selectedEventSeedTypes, ty)  -- Gold/Rainbow filter kept on every path
+    end
+    -- PRIMARY (owner-verified mechanic): Shooting Star packs spawn as a Part with a ProximityPrompt
+    -- under SeedPackSpawnServerLocations; collect = teleport to the part + fire the prompt.
+    local locations = map:FindFirstChild("SeedPackSpawnServerLocations")
+    local firedProx = false
+    if locations and fireProx then
+        for _, d in ipairs(locations:GetDescendants()) do
+            if not autoSeedEventEnabled then return end
+            if d:IsA("ProximityPrompt") and d.Enabled ~= false then
+                local part = d.Parent
+                if part and part:IsA("BasePart") and typeOk(part) then
+                    firedProx = true
                     local hrp = hrpNow()
-                    if hrp then
-                        local ok, pos = pcall(function() return sp:GetPivot().Position end)
-                        if ok then pcall(function() hrp.CFrame = CFrame.new(pos + Vector3.new(0, 4, 0)) end); task.wait(0.1) end
-                    end
-                    if ClickPack then pcall(function() ClickPack:Fire(id) end) end
-                    task.wait(0.05)
+                    if hrp then pcall(function() hrp.CFrame = part.CFrame + Vector3.new(0, 3, 0) end); task.wait(0.2) end
+                    pcall(function() fireProx(d) end)
+                    task.wait(0.2)
                 end
             end
         end
     end
-    -- fallback: also fire any transient click detectors the game spawns for the pack (type-filtered)
-    local conts = { client, Workspace:FindFirstChild("Temporary") }
-    for _, cont in ipairs(conts) do
+    if firedProx then return end
+    -- FALLBACK 1: client-side packs carry a "SeedPack" id, claimed via the ClickPack remote (teleport-then-claim)
+    local client = map:FindFirstChild("SeedPackSpawnClient")
+    if client then
+        for _, sp in ipairs(client:GetChildren()) do
+            if not autoSeedEventEnabled then return end
+            local id = sp:GetAttribute("SeedPack")
+            if id and typeOk(sp) then
+                local hrp = hrpNow()
+                if hrp then
+                    local ok, pos = pcall(function() return sp:GetPivot().Position end)
+                    if ok then pcall(function() hrp.CFrame = CFrame.new(pos + Vector3.new(0, 4, 0)) end); task.wait(0.1) end
+                end
+                if ClickPack then pcall(function() ClickPack:Fire(id) end) end
+                task.wait(0.05)
+            end
+        end
+    end
+    -- FALLBACK 2: fire any transient click detectors the game spawns for the pack (type-filtered)
+    for _, cont in ipairs({ client, Workspace:FindFirstChild("Temporary") }) do
         if cont then
             for _, d in ipairs(cont:GetDescendants()) do
-                if d:IsA("ClickDetector") and fireCD then
-                    local passes = true
-                    if #selectedEventSeedTypes > 0 then
-                        local ty = eventSeedTypeOf(d)
-                        if ty and not inSet(selectedEventSeedTypes, ty) then passes = false end
-                    end
-                    if passes then pcall(fireCD, d) end
-                end
+                if d:IsA("ClickDetector") and fireCD and typeOk(d) then pcall(fireCD, d) end
             end
         end
     end
@@ -2363,9 +2392,12 @@ task.spawn(function()
             if autoCollectAcornsEnabled then for _, it in ipairs(droppedItems("Acorn")) do targets[#targets + 1] = it end end
             for _, it in ipairs(targets) do
                 if not (autoCollectSeedsEnabled or autoCollectAcornsEnabled) then break end
+                if ActivityPriority.currentActivity ~= "AutoCollect" then break end
                 local hrp = hrpNow()
                 if hrp and it.inst and it.inst.Parent then
                     pcall(function() hrp.CFrame = CFrame.new(it.pos + Vector3.new(0, 3, 0)) end)
+                    task.wait(0.1)
+                    if it.prompt and fireProx then pcall(function() fireProx(it.prompt) end) end  -- pickup now needs the prompt fired
                     task.wait(0.05)
                 end
             end
