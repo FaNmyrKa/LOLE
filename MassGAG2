@@ -7,9 +7,9 @@ getgenv().UserConfig = {
     ["Auto Harvest"] = true,   -- сбор
     ["Auto Sell"]    = true,   -- продажа
     ["Auto Plant Seed"] = true,
-    ["Limit Plant Seed"] = { ["Carrot"] = 50 },        -- ключи = и список посадки
+    ["Limit Plant Seed"] = { ["Carrot"] = 50 }, { ["Bamboo"] = 9999999999999999999999999999999999999999 }, { ["Mushroom"] = 9999999999999999 },        -- ключи = и список посадки
     ["Limit Buy Seed"] = {                            -- ключи = и список покупки
-        ["Carrot"] = 5, ["Strawberry"] = 5, ["Bamboo"] = 9999,
+        ["Carrot"] = 5, ["Strawberry"] = 5, ["Bamboo"] = 999999999999999999, ["Mushroom"] = 9999999999,
         ["Moon Bloom"] = 50000, ["Dragon's Breath"] = 50000,
     },
     ["Blacklist Shovel"] = {"Dragon's Breath", "Moon Bloom", "Ghost Pepper", "Venus Fly Trap"},  -- не шовелить
