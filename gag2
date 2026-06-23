@@ -3680,13 +3680,26 @@ function applyUserConfig()
 end
 
 MacLib:SetFolder("ApelHub")
+-- Config order matters: restore the saved autoload UI FIRST, THEN apply the explicit external config
+-- (set before this hub loaded) so it overrides the saved one. LoadAutoLoadConfig can apply
+-- asynchronously (its toggle callbacks fire over several frames), so we (a) run it in the same thread
+-- before applying, and (b) apply the external config TWICE — once after a short settle and once a beat
+-- later — so a late autoload callback can't silently revert it. Re-applying is idempotent.
 task.spawn(function()
-    MacLib:LoadAutoLoadConfig()
-end)
-task.spawn(function()
-    task.wait(1.6)  -- after autoload, so explicit _G config wins
-    pcall(applyGConfig)
-    pcall(applyUserConfig)  -- competitor-style getgenv().UserConfig compatibility (applied last)
+    -- detect an explicit config up-front (before autoload can't hide it)
+    local hasG = (_G and _G.ApelHubConfig) or (getgenv and getgenv().ApelHubConfig)
+    local hasU = (getgenv and getgenv().UserConfig) or (_G and _G.UserConfig)
+    pcall(function() MacLib:LoadAutoLoadConfig() end)  -- restore saved UI state first
+    for _, d in ipairs({ 0.5, 2.0 }) do
+        task.wait(d)
+        local okG, errG = pcall(applyGConfig)
+        local okU, errU = pcall(applyUserConfig)
+        if not okG then warn("[Apel Hub] applyGConfig error:", errG) end
+        if not okU then warn("[Apel Hub] applyUserConfig error:", errU) end
+    end
+    if not (hasG or hasU) then
+        pcall(function() Window:Notify({ Title = "Apel Hub", Description = "No external config detected (_G.ApelHubConfig / getgenv().UserConfig). Set it BEFORE the loadstring line.", Lifetime = 7 }) end)
+    end
 end)
 task.spawn(function()
     tabs.Farm:Select()
