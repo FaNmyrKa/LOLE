@@ -1,6 +1,11 @@
 getgenv().UserConfig = {
     ["FPS Cap"] = 0,                                  -- 0 = без капа (у них в примере было 7 = очень низко)
     ["Auto Buy Seed"] = true,
+    ["Status Overlay"] = true,   -- чёрная панель (алиасы: "Black Panel", "Dark Screen")
+    ["FPS Boost"]      = true,   -- лёгкий буст (off post-fx/тени/low quality)
+    ["FPS Max"]        = true,  -- агрессивный (доп. убивает текстуры/партиклы)
+    ["Auto Harvest"] = true,   -- сбор
+    ["Auto Sell"]    = true,   -- продажа
     ["Auto Plant Seed"] = true,
     ["Limit Plant Seed"] = { ["Carrot"] = 50 },        -- ключи = и список посадки
     ["Limit Buy Seed"] = {                            -- ключи = и список покупки
