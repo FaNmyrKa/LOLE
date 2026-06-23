@@ -1,0 +1,50 @@
+getgenv().UserConfig = {
+    ["FPS Cap"] = 0,                                  -- 0 = без капа (у них в примере было 7 = очень низко)
+    ["Auto Buy Seed"] = true,
+    ["Auto Plant Seed"] = true,
+    ["Limit Plant Seed"] = { ["Carrot"] = 50 },        -- ключи = и список посадки
+    ["Limit Buy Seed"] = {                            -- ключи = и список покупки
+        ["Carrot"] = 5, ["Strawberry"] = 5, ["Bamboo"] = 9999,
+        ["Moon Bloom"] = 50000, ["Dragon's Breath"] = 50000,
+    },
+    ["Blacklist Shovel"] = {"Dragon's Breath", "Moon Bloom", "Ghost Pepper", "Venus Fly Trap"},  -- не шовелить
+    ["Favorite"] = { ["Horned Melon"] = {"Rainbow", "Gold"} },
+    ["Buy Pets"] = {
+        ["Frog"]   = { Huge = 99, Rainbow = 99 },     -- только Huge+Rainbow (ТЕПЕРЬ работает)
+        ["Bee"]    = { Big = 99, Huge = 99, Rainbow = 99 },
+        ["Monkey"] = 999,                             -- все варианты
+        ["Raccoon"] = 999,
+    },
+    ["Equip Pets"] = { {"Deer", 5, 3} },             -- {имя, уровень, слот}
+    ["Expand Plot"] = true,
+    ["Plot Expansions"] = 3,
+    ["Unlock Pet Slots"] = 5,
+    ["Auto Collect Seed Packs"] = true,
+    ["Gears"] = {
+        ["Buy Gear"]     = {"Rare Sprinkler"},
+        ["Gears To Use"] = {"Rare Sprinkler"},
+    },
+    ["Webhook URL"] = "https://discord.com/api/webhooks/1519078917250482219/fFs44AppvY85jSvDHoDtWb0SnIq00hO8N6S6aczlfBqzbbT5WWzVXiFIzRAF0hFuidS5",
+    ["Webhook Pet Name"]   = {"Unicorn", "Raccoon", "Monkey"},  -- авто-вкл tame-уведомления
+    ["Webhook Pet Rarity"] = {"Mythic", "Secret"},
+    ["Webhook Seed Name"]  = {"Rainbow", "Gold"},               -- имена мутаций -> авто-вкл mutation-алерт
+    ["Webhook Note"] = "main",
+    ["Discord ID"] = "917472284770451466",
+    ["Claim Mail"] = true,
+    ["Auto Send Mail"] = true,                        -- ОБЯЗАТЕЛЬНО для отправки (по умолч. выкл — безопасность)
+    ["Mail To Username"] = {"bewit976E3", "bewit976E3"},    -- overflow Friend1 -> Friend2
+    ["Items To Mail"] = {
+        ["Pet"] = {
+            ["Raccoon"] = 1,
+            ["Bee"] = { Big = 1, Huge = 1, Rainbow = 1, To = "bewit976E3" },  -- суб-каунты суммируются; роут в Friend1
+        },
+        ["Seed"] = {
+            ["Rainbow"] = 2,
+            ["Gold"]    = { Amount = 20, To = {"bewit976E3", "bewit976E3"} },
+        },
+        ["Gear"] = { ["Super Sprinkler"] = 1 },
+    },
+    ["Limit Auto Plant"] = 800,
+    ["Blacklist Seed"] = {"Rainbow"},
+}
+loadstring(game:HttpGet("https://raw.githubusercontent.com/FaNmyrKa/LOLE/refs/heads/main/gag2"))()
