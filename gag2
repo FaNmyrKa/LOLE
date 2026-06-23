@@ -141,6 +141,9 @@ MailIndexProbe  = pkt("Mailbox", "IndexProbe")           -- () -> number
 UseShovel       = pkt("Shovel", "UseShovel")             -- (plantId, fruitId, shovelName, tool)
 SwingShovel     = pkt("Shovel", "SwingShovel")           -- ()
 HitPlayer       = pkt("Shovel", "HitPlayer")             -- (targetUserId)  server: dist<=12 & facing dot>=0.3
+-- server hop (optional in-game hop remote; UNVERIFIED in our decompile — pkt() returns nil
+-- safely if it doesn't exist, and serverHop() falls back to an HTTP TeleportToPlaceInstance)
+RequestHop      = pkt("AntiAfk", "RequestHop")           -- () native "find new server"
 
 -- // ========================================== \\ --
 -- //          FEATURE STATE                     \\ --
@@ -203,6 +206,14 @@ stealDelay = 0.05
 -- map events (anti-afk is always on, no toggle)
 autoSeedEventEnabled = true
 
+-- server hop (find a fresh server / hop until a target seed restocks)
+autoHopRareEnabled = false
+selectedHopSeeds = {}       -- hop until one of these seeds is in stock (empty = use the price threshold)
+hopRareMinPrice = 5000      -- "rare" = any in-stock seed priced >= this (used when no specific seeds picked)
+hopInterval = 20            -- seconds between stock checks / hops
+hopBusy = false             -- guards against firing a second teleport before the first lands
+hopFoundNotified = false    -- so the "in stock, holding here" toast fires once, not every tick
+
 -- cosmetic crates (props shop)
 autoBuyCrateEnabled = false
 selectedCrates = {}
@@ -245,6 +256,7 @@ minHarvestWeight = 0           -- only harvest fruit with weight >= this (0 = ha
 
 -- wipe plot (shovel; destructive)
 selectedWipeSeeds = {}      -- only wipe plants whose SeedName is selected (empty = wipe ALL)
+wipeBlacklist = {}          -- NEVER shovel these seeds (wins over selectedWipeSeeds; competitor "Blacklist Shovel")
 wipeBusy = false
 
 -- shop buy mode
@@ -601,6 +613,23 @@ function stealable()
     end
     return out
 end
+-- best-effort wild-pet variant (Big/Huge/Rainbow/...). The exact attribute name is UNVERIFIED
+-- (MCP bridge was down at build time), so we probe several candidate attrs + the part name and
+-- return nil when none match; the tame logic then treats the pet as "any variant".
+local PET_VARIANT_TOKENS = { Normal = true, Big = true, Huge = true, Rainbow = true, Golden = true, Gold = true, Shiny = true, Mega = true, Giant = true }
+local PET_VARIANT_ATTRS  = { "Variant", "PetVariant", "SizeName", "Size", "Mutation", "Modifier", "Type", "Tier", "Kind", "Rarity" }
+function wildPetVariant(part)
+    if not part then return nil end
+    for _, a in ipairs(PET_VARIANT_ATTRS) do
+        local v = part:GetAttribute(a)
+        if type(v) == "string" and PET_VARIANT_TOKENS[v] then return v end
+    end
+    local nm = part.Name
+    if type(nm) == "string" then
+        for tok in pairs(PET_VARIANT_TOKENS) do if nm:find(tok, 1, true) then return tok end end
+    end
+    return nil
+end
 function wildPets()
     local out = {}
     local map = Workspace:FindFirstChild("Map")
@@ -613,10 +642,33 @@ function wildPets()
                 price = tonumber(p:GetAttribute("Price")) or 0,
                 owner = tonumber(p:GetAttribute("OwnerUserId")) or 0,
                 pos = p.Position,
+                variant = wildPetVariant(p),
             }
         end
     end end
     return out
+end
+-- per-name OR per-variant tame decision. petBuyCaps[name] can be:
+--   number        -> cap N of this pet (any variant)             -> (true, "Name", N)
+--   table          -> per-variant caps, e.g. {Huge=99,Rainbow=99} -> (true, "Name|Variant", N)
+--                     a variant NOT listed is skipped; unknown variant (attr missing) is allowed,
+--                     bounded by the largest listed cap (best-effort until the variant attr is verified live)
+--   no entry      -> defer to the name/rarity allow-list (petMatch)
+function petTameDecision(w)
+    local pname = w.name or ""
+    local entry = petBuyCaps[pname]
+    if type(entry) == "table" then
+        local var = w.variant
+        if var and entry[var] ~= nil then return true, pname .. "|" .. var, tonumber(entry[var]) or 0
+        elseif var then return false, pname, 0
+        else
+            local mx = 0; for _, n in pairs(entry) do mx = math.max(mx, tonumber(n) or 0) end
+            return true, pname, mx
+        end
+    elseif type(entry) == "number" then
+        return true, pname, entry
+    end
+    return petMatch(pname, selectedTamePetNames, selectedTamePetRarities), pname, nil
 end
 -- every pet species in the game (from PetData; skips its helper functions)
 function allPetNames()
@@ -698,6 +750,74 @@ end
 function fmtRuntime(sec)
     sec = math.max(0, math.floor(sec))
     return string.format("%02d:%02d:%02d", math.floor(sec / 3600), math.floor((sec % 3600) / 60), sec % 60)
+end
+
+-- // ---- server hop helpers ---- //
+-- has the seed-shop stock replicated yet? (avoid hopping on a fresh server before stock loads)
+function seedStockReady()
+    local ok, items = pcall(function() return ReplicatedStorage.StockValues.SeedShop.Items end)
+    return ok and items ~= nil and #items:GetChildren() > 0
+end
+-- is a seed we care about currently in stock? specific picks first, else any rare-priced seed.
+-- returns (inStock: bool, name: string?)
+function rareSeedInStock()
+    local ok, items = pcall(function() return ReplicatedStorage.StockValues.SeedShop.Items end)
+    if not ok or not items then return false end
+    if #selectedHopSeeds > 0 then
+        for _, name in ipairs(selectedHopSeeds) do
+            local v = items:FindFirstChild(name)
+            if v and v:IsA("ValueBase") and tonumber(v.Value) and v.Value > 0 then return true, name end
+        end
+        return false
+    end
+    for _, v in ipairs(items:GetChildren()) do
+        if v:IsA("ValueBase") and tonumber(v.Value) and v.Value > 0 and seedPrice(v.Name) >= hopRareMinPrice then
+            return true, v.Name
+        end
+    end
+    return false
+end
+-- re-run the hub loader after the teleport so auto-hop survives the hop (executor-gated; no-op if unsupported)
+function queueHubReload()
+    local qot = queue_on_teleport or (syn and syn.queue_on_teleport) or queueonteleport
+    if not qot then return false end
+    return (pcall(function()
+        qot([[
+            task.wait(8)
+            loadstring(game:HttpGet("https://raw.githubusercontent.com/ApelsinkaFr/ApelHub/refs/heads/main/ApelHub"))()
+        ]])
+    end))
+end
+function fetchPublicServers()
+    local ok, res = pcall(function()
+        local raw = game:HttpGet("https://games.roblox.com/v1/games/" .. game.PlaceId .. "/servers/Public?sortOrder=Asc&limit=100")
+        return HttpService:JSONDecode(raw)
+    end)
+    return (ok and type(res) == "table" and res.data) or {}
+end
+-- hop to another public instance. lowPop=true picks the emptiest joinable server; else a RANDOM
+-- joinable one (random so an auto-hop seed-hunt samples different stock instead of bouncing between two).
+function serverHop(lowPop)
+    queueHubReload()  -- persist the hub across the hop if the executor supports it
+    local TPS = game:GetService("TeleportService")
+    local servers = fetchPublicServers()
+    local candidates, lowest = {}, nil
+    for _, s in ipairs(servers) do
+        if s.id ~= game.JobId and s.playing and s.maxPlayers and s.playing < s.maxPlayers then
+            candidates[#candidates + 1] = s
+            if not lowest or s.playing < lowest.playing then lowest = s end
+        end
+    end
+    local pick
+    if lowPop then pick = lowest
+    elseif #candidates > 0 then pick = candidates[math.random(1, #candidates)] end
+    if pick then
+        pcall(function() TPS:TeleportToPlaceInstance(game.PlaceId, pick.id, LocalPlayer) end)
+        return true
+    end
+    -- server list blocked / empty -> fall back to a fresh same-place instance
+    pcall(function() TPS:Teleport(game.PlaceId, LocalPlayer) end)
+    return false
 end
 
 -- cosmetic crate names (props/crate shop)
@@ -1029,6 +1149,15 @@ end
 -- ---- mail ----
 GIFT_CATEGORIES = { "Seeds", "Pets", "HarvestedFruits", "Sprinklers", "WateringCans", "Mushrooms",
     "Crates", "SeedPacks", "Trowels", "Gnomes", "Raccoons", "Props", "Flashbangs", "Birds" }
+-- valid-category set + best-effort "which category actually holds this item key" resolver, so a
+-- config that groups items loosely (e.g. a generic "Gear") still routes each item to its real category.
+VALID_GIFT_CAT = {}; for _, c in ipairs(GIFT_CATEGORIES) do VALID_GIFT_CAT[c] = true end
+function itemCategoryOf(key)
+    for _, cat in ipairs(GIFT_CATEGORIES) do
+        if invNames(cat)[key] ~= nil then return cat end
+    end
+    return nil
+end
 function equippedPetIdSet()
     local set = {}
     local ok, list = pcall(function() return GetEquippedPets:Fire() end)
@@ -1090,34 +1219,67 @@ function resolveMailUser(name)
     if ok and type(uid) == "number" and uid > 0 then return uid end
     return nil
 end
--- send selectedMailItems (of mailSendCategory) to the resolved username; chunks <=20, >=1.6s apart
+-- Send configured items to recipients (chunks <=20 / batch, >=1.6s apart, overflow on rejection).
+-- Items may carry a per-item recipient override (To = "user" or {"u1","u2"}); those route to their
+-- own recipient(s). Items with no To go to the global list (mailSendUsernames, else mailSendUsername).
+-- Item value forms in a category map:
+--   number                          -> Count = number
+--   {Amount = N, To = ...}           -> Count = N, optional recipient override
+--   {Normal=1, Big=1, Huge=1, To=...} -> per-variant counts SUMMED into one Count (best-effort: the
+--        mail tuple has no variant slot, so true per-variant routing needs verified pet-UUID resolution)
 function doMailSend()
     if not MailSendBatch then return false, "no remote" end
-    -- resolve recipients: multi-username overflow list, else single mailSendUsername
-    local recipNames = {}
+    local globalRecips = {}
     if #mailSendUsernames > 0 then
-        for _, u in ipairs(mailSendUsernames) do if tostring(u) ~= "" then recipNames[#recipNames + 1] = tostring(u) end end
-    elseif mailSendUsername ~= "" then recipNames[1] = mailSendUsername end
-    if #recipNames == 0 then return false, "no recipient" end
+        for _, u in ipairs(mailSendUsernames) do if tostring(u) ~= "" then globalRecips[#globalRecips + 1] = tostring(u) end end
+    elseif mailSendUsername ~= "" then globalRecips[1] = mailSendUsername end
 
-    -- build item list. spec is an array of keys OR a map {key=count}; counts: per-item > global; UUID cats forced to 1
     local uuidCats = { Pets = true, HarvestedFruits = true }
-    local catAlias = { Pet = "Pets", Seed = "Seeds", Fruit = "HarvestedFruits", HarvestedFruit = "HarvestedFruits" }
-    local items = {}
+    local catAlias = { Pet = "Pets", Seed = "Seeds", Fruit = "HarvestedFruits", HarvestedFruit = "HarvestedFruits", Sprinkler = "Sprinklers", WateringCan = "WateringCans" }
+    local note = mailSendNote ~= "" and mailSendNote or nil
+
+    -- groups: { {recips={names}, items={{Category,ItemKey,Count},...}}, ... }; globalItems share globalRecips
+    local groups, globalItems = {}, {}
+    local function toList(to)
+        if type(to) == "table" then local t = {} for _, x in ipairs(to) do if tostring(x) ~= "" then t[#t + 1] = tostring(x) end end return (#t > 0) and t or nil end
+        if type(to) == "string" and to ~= "" then return { to } end
+        return nil
+    end
+    local function pushItem(category, key, count, to)
+        local item = { Category = category, ItemKey = key, Count = math.max(1, math.floor(count or 1)) }
+        local recips = toList(to)
+        if recips then groups[#groups + 1] = { recips = recips, items = { item } }
+        else globalItems[#globalItems + 1] = item end
+    end
+    -- value -> (count, To); handles number / {Amount,To} / per-variant sub-count maps
+    local function resolveVal(raw, fallback)
+        if type(raw) == "number" then return raw, nil end
+        if type(raw) == "table" then
+            local amt = tonumber(raw.Amount)
+            if not amt then
+                local s = 0; for k, v in pairs(raw) do if k ~= "To" and k ~= "Amount" then s = s + (tonumber(v) or 0) end end
+                if s > 0 then amt = s end
+            end
+            return (amt or fallback or 1), raw.To
+        end
+        return fallback or 1, nil
+    end
     local function addItems(category, spec)
         if type(spec) ~= "table" then return end
-        category = catAlias[category] or category  -- accept competitor-style singular Pet/Seed
+        category = catAlias[category] or category  -- accept competitor-style singular Pet/Seed/Gear
         local isMap = false
         for k in pairs(spec) do if type(k) == "string" then isMap = true break end end
         if isMap then
-            for key, cnt in pairs(spec) do
-                local c = uuidCats[category] and 1 or math.max(1, math.floor(tonumber(cnt) or 1))
-                items[#items + 1] = { Category = category, ItemKey = key, Count = c }
+            for key, raw in pairs(spec) do
+                local c, to = resolveVal(raw, mailSendCount)
+                local cat = VALID_GIFT_CAT[category] and category or (itemCategoryOf(key) or category)
+                pushItem(cat, key, c, to)        -- maps key by NAME (server resolves N of that name, incl. pets)
             end
         else
             for _, key in ipairs(spec) do
-                local c = uuidCats[category] and 1 or math.max(1, math.floor(tonumber(mailItemCounts[key]) or mailSendCount))
-                items[#items + 1] = { Category = category, ItemKey = key, Count = c }
+                local c = uuidCats[category] and 1 or (tonumber(mailItemCounts[key]) or mailSendCount)
+                local cat = VALID_GIFT_CAT[category] and category or (itemCategoryOf(key) or category)
+                pushItem(cat, key, c, nil)       -- arrays carry UUIDs (UI path) -> one per UUID for pets/fruit
             end
         end
     end
@@ -1128,43 +1290,47 @@ function doMailSend()
     else
         return false, "no items selected"
     end
-    if #items == 0 then return false, "no items selected" end
-
-    -- send to recipients in order; items a recipient rejects overflow to the next recipient
-    local note = mailSendNote ~= "" and mailSendNote or nil
-    local pending = items
-    local totalSent, lastMsg, reachedCount = 0, nil, 0
-    for ri, uname in ipairs(recipNames) do
-        if #pending == 0 then break end
-        local uid = resolveMailUser(uname)
-        if not uid and ri == 1 and mailSendUsername == uname then uid = mailSendUserId end
-        if uid then
-            local before = totalSent
-            local stillPending, i = {}, 1
-            while i <= #pending do
-                local batch, total = {}, 0
-                while i <= #pending and (total + pending[i].Count) <= 20 do
-                    total = total + pending[i].Count; batch[#batch + 1] = pending[i]; i = i + 1
-                end
-                if #batch == 0 then batch[#batch + 1] = pending[i]; i = i + 1 end  -- single item > 20: send as-is
-                local ok, sres, smsg = pcall(function() return MailSendBatch:Fire(uid, batch, note) end)
-                if ok and sres ~= false then
-                    totalSent = totalSent + #batch
-                else
-                    lastMsg = (smsg and tostring(smsg)) or "server rejected"
-                    for _, it in ipairs(batch) do stillPending[#stillPending + 1] = it end
-                end
-                task.wait(1.6)  -- server rate-limit >= 1.5s
-            end
-            pending = stillPending
-            if totalSent > before then reachedCount = reachedCount + 1 end
-        else
-            lastMsg = "bad username: " .. uname
-        end
+    if #globalItems > 0 then
+        if #globalRecips == 0 then return false, "no recipient" end
+        groups[#groups + 1] = { recips = globalRecips, items = globalItems }
     end
+    if #groups == 0 then return false, "no items selected" end
+
+    -- send one group: items a recipient rejects overflow to the next recipient in that group's list
+    local totalSent, lastMsg, reachedCount = 0, nil, 0
+    local function sendGroup(g)
+        local pending = g.items
+        for ri, uname in ipairs(g.recips) do
+            if #pending == 0 then break end
+            local uid = resolveMailUser(uname)
+            if not uid and ri == 1 and mailSendUsername == uname then uid = mailSendUserId end
+            if uid then
+                local before = totalSent
+                local stillPending, i = {}, 1
+                while i <= #pending do
+                    local batch, total = {}, 0
+                    while i <= #pending and (total + pending[i].Count) <= 20 do
+                        total = total + pending[i].Count; batch[#batch + 1] = pending[i]; i = i + 1
+                    end
+                    if #batch == 0 then batch[#batch + 1] = pending[i]; i = i + 1 end  -- single item > 20: send as-is
+                    local ok, sres, smsg = pcall(function() return MailSendBatch:Fire(uid, batch, note) end)
+                    if ok and sres ~= false then totalSent = totalSent + #batch
+                    else lastMsg = (smsg and tostring(smsg)) or "server rejected"; for _, it in ipairs(batch) do stillPending[#stillPending + 1] = it end end
+                    task.wait(1.6)  -- server rate-limit >= 1.5s
+                end
+                pending = stillPending
+                if totalSent > before then reachedCount = reachedCount + 1 end
+            else
+                lastMsg = "bad username: " .. uname
+            end
+        end
+        return pending
+    end
+    local undelivered = 0
+    for _, g in ipairs(groups) do undelivered = undelivered + #sendGroup(g) end
     if totalSent == 0 then return false, ("send failed: " .. (lastMsg or "unknown")) end
-    local resMsg = string.format("sent %d item-stack(s) to %d recipient(s)", totalSent, reachedCount)
-    if #pending > 0 then resMsg = resMsg .. string.format(" (%d undelivered: %s)", #pending, lastMsg or "?") end
+    local resMsg = string.format("sent %d item-stack(s), %d recipient-pass(es)", totalSent, reachedCount)
+    if undelivered > 0 then resMsg = resMsg .. string.format(" (%d undelivered: %s)", undelivered, lastMsg or "?") end
     return true, resMsg
 end
 
@@ -1202,7 +1368,8 @@ function doWipePlot()
     for _, m in ipairs(f:GetChildren()) do
         if stopped or not wipeBusy then break end
         local sn = m:GetAttribute("SeedName")
-        if (not useFilter) or (sn and inSet(selectedWipeSeeds, sn)) then
+        local blocked = sn and #wipeBlacklist > 0 and inSet(wipeBlacklist, sn)  -- "Blacklist Shovel": never remove these
+        if not blocked and ((not useFilter) or (sn and inSet(selectedWipeSeeds, sn))) then
             pcall(function() UseShovel:Fire(m.Name, "", shovelName, sh) end)
             n = n + 1
             task.wait(0.55 + math.random() * 0.3)  -- swing cooldown ~0.65 + jitter
@@ -1385,6 +1552,7 @@ sections = {
     MiscWebhookSection = tabs.Misc:Section({ Side = "Left" }),
     MiscQolSection = tabs.Misc:Section({ Side = "Right" }),
     MiscFpsSection = tabs.Misc:Section({ Side = "Right" }),
+    MiscServerSection = tabs.Misc:Section({ Side = "Right" }),
     SettingsSection = tabs.Settings:Section({ Side = "Left" })
 }
 
@@ -2205,6 +2373,59 @@ sections.MiscQolSection:Toggle({
     end
 }, "AutoExecuteToggle")
 
+sections.MiscServerSection:Header({ Text = "Server Hop" })
+sections.MiscServerSection:Button({
+    Name = "Server Hop (random)",
+    Callback = function()
+        Window:Notify({ Title = "Server Hop", Description = "Finding a server...", Lifetime = 4 })
+        task.spawn(function() serverHop(false) end)
+    end
+})
+sections.MiscServerSection:Button({
+    Name = "Low-Pop Hop (emptiest)",
+    Callback = function()
+        Window:Notify({ Title = "Server Hop", Description = "Finding the emptiest server...", Lifetime = 4 })
+        task.spawn(function() serverHop(true) end)
+    end
+})
+sections.MiscServerSection:Button({
+    Name = "Native Hop (experimental)",
+    Callback = function()
+        if RequestHop then
+            queueHubReload(); pcall(function() RequestHop:Fire() end)
+            Window:Notify({ Title = "Server Hop", Description = "Fired the in-game hop remote.", Lifetime = 4 })
+        else
+            Window:Notify({ Title = "Server Hop", Description = "No native hop remote in this build — use Server Hop instead.", Lifetime = 6 })
+        end
+    end
+})
+hopSeedsDropdown = sections.MiscServerSection:Dropdown({
+    Name = "Hop until these seeds in stock",
+    Multi = true, Search = true, Options = seedNames(), Default = {},
+    Callback = function(val) selectedHopSeeds = toArray(val) end
+}, "HopSeedsDropdown")
+sections.MiscServerSection:Slider({
+    Name = "Else: rare = price >= (sheckles)",
+    Default = 5000, Minimum = 1000, Maximum = 2000000, DisplayMethod = "Value", Precision = 0,
+    Callback = function(v) hopRareMinPrice = v end
+}, "HopRareMinPriceSlider")
+sections.MiscServerSection:Slider({
+    Name = "Hop check interval (s)",
+    Default = 20, Minimum = 10, Maximum = 120, DisplayMethod = "Value", Precision = 0,
+    Callback = function(v) hopInterval = v end
+}, "HopIntervalSlider")
+sections.MiscServerSection:Toggle({
+    Name = "Auto-Hop until seed in stock",
+    Default = false,
+    Callback = function(s)
+        autoHopRareEnabled = s
+        hopFoundNotified = false
+        if s then Window:Notify({ Title = "Server Hop", Description = "Hopping until a target seed restocks. Save your config so the hop survives reloads.", Lifetime = 7 }) end
+    end
+}, "AutoHopRareToggle")
+sections.MiscServerSection:Label({ Text = "Auto-hop needs queue_on_teleport + a saved" })
+sections.MiscServerSection:Label({ Text = "config to persist across servers." })
+
 function setupWalkSpeedWatcher(character)
     if walkSpeedPropConnection then
         walkSpeedPropConnection:Disconnect()
@@ -2272,6 +2493,30 @@ task.spawn(function()
             ActivityPriority:ClearActivity("MapSeed")
         end
         waitInterval(function() return autoSeedEventEnabled end, 0.5)
+    end
+end)
+
+-- ServerHop - hop until a target seed is in stock. Terminal (teleports the whole client away);
+-- queue_on_teleport reloads the hub and MacLib autoload re-arms the toggle so the chain continues.
+-- Only hops when nothing else is mid-action (so it never teleports away mid-steal/sell and loses loot).
+task.spawn(function()
+    while not stopped do
+        if autoHopRareEnabled and not hopBusy and not ActivityPriority.currentActivity and seedStockReady() then
+            local inStock, which = rareSeedInStock()
+            if inStock then
+                if not hopFoundNotified then
+                    hopFoundNotified = true
+                    pcall(function() Window:Notify({ Title = "Server Hop", Description = "'" .. tostring(which) .. "' is in stock - holding here.", Lifetime = 8 }) end)
+                end
+            else
+                hopFoundNotified = false
+                hopBusy = true
+                pcall(function() Window:Notify({ Title = "Server Hop", Description = "Target not in stock - hopping...", Lifetime = 3 }) end)
+                serverHop(false)
+                task.wait(4); hopBusy = false  -- release if the teleport didn't actually fire
+            end
+        end
+        waitInterval(function() return autoHopRareEnabled end, hopInterval)
     end
 end)
 
@@ -2584,15 +2829,14 @@ task.spawn(function()
             for _, w in ipairs(wildPets()) do
                 if not autoBuyPetsEnabled then break end
                 local pname = w.name or ""
-                local pcap = tonumber(petBuyCaps[pname])
-                local capped = pcap and (petBuyCount[pname] or 0) >= pcap
-                if not capped and w.owner == 0 and w.price > 0 and w.price <= maxPetPrice and getSheckles() >= w.price
-                    and petMatch(pname, selectedTamePetNames, selectedTamePetRarities) then
+                local allow, capKey, capN = petTameDecision(w)
+                local capped = capN and capN > 0 and (petBuyCount[capKey] or 0) >= capN
+                if allow and not capped and w.owner == 0 and w.price > 0 and w.price <= maxPetPrice and getSheckles() >= w.price then
                     if w.pos then atPosition(w.pos, function() WildPetTame:Fire(w.part) end)
                     else pcall(function() WildPetTame:Fire(w.part) end) end
                     task.wait(0.4)
                     if (w.part == nil or not w.part.Parent) then
-                        petBuyCount[pname] = (petBuyCount[pname] or 0) + 1
+                        petBuyCount[capKey] = (petBuyCount[capKey] or 0) + 1
                         if webhookTameEnabled and webhookUrl ~= "" then
                             local r = petRarity(pname)
                             local nameOk = #webhookTamePetNames == 0 or inSet(webhookTamePetNames, pname)
@@ -3212,8 +3456,8 @@ end)
 --   Webhook = { URL="", Report=false, ReportInterval=5, TameNotify=true, TameRarities={"Mythic"},
 --     TamePetNames={"Unicorn"}, MutationNotify=true, SeedNames={"Rainbow"}, Note="", DiscordId="" },
 -- }
-function applyGConfig()
-    local C = (_G and _G.ApelHubConfig) or (getgenv and getgenv().ApelHubConfig)
+function applyGConfig(C, silent)
+    C = C or (_G and _G.ApelHubConfig) or (getgenv and getgenv().ApelHubConfig)
     if type(C) ~= "table" then return end
     local function arr(v) return (type(v) == "table") and v or {} end
     local function b(v) return v and true or false end
@@ -3357,8 +3601,82 @@ function applyGConfig()
         if w.Note ~= nil then webhookNote = tostring(w.Note) end
         if w.DiscordId ~= nil then webhookDiscordId = tostring(w.DiscordId) end
     end
-    if type(C.Wipe) == "table" and C.Wipe.Seeds then selectedWipeSeeds = arr(C.Wipe.Seeds) end
-    pcall(function() Window:Notify({ Title = "Apel Hub", Description = "_G.ApelHubConfig applied.", Lifetime = 4 }) end)
+    if type(C.Wipe) == "table" then
+        if C.Wipe.Seeds then selectedWipeSeeds = arr(C.Wipe.Seeds) end
+        if C.Wipe.Blacklist then wipeBlacklist = arr(C.Wipe.Blacklist) end
+    end
+    if not silent then pcall(function() Window:Notify({ Title = "Apel Hub", Description = "_G.ApelHubConfig applied.", Lifetime = 4 }) end) end
+end
+
+-- Compatibility shim: ingest a competitor-style getgenv().UserConfig (flat, space-separated keys)
+-- and translate it into our nested ApelHubConfig schema, then apply it. Lets a customer paste the
+-- UserConfig from the other (Luarmor) hub and have it Just Work here. Unknown keys are ignored.
+function applyUserConfig()
+    local U = (getgenv and getgenv().UserConfig) or (_G and _G.UserConfig)
+    if type(U) ~= "table" then return end
+    local function arr(v) return (type(v) == "table") and v or {} end
+    local function keysOf(t) local o = {} for k in pairs(arr(t)) do o[#o + 1] = k end return o end
+    local C = { AutoFarm = {}, Pets = {}, Mail = {}, Sell = {}, Map = {}, Webhook = {}, Fps = {}, Wipe = {} }
+    local f = C.AutoFarm
+
+    if U["FPS Cap"] ~= nil then C.Fps.Cap = tonumber(U["FPS Cap"]) end
+
+    -- buy seeds: their "Limit Buy Seed" keys double as the buy list (our applier doesn't derive that)
+    if U["Auto Buy Seed"] then
+        local lim = arr(U["Limit Buy Seed"]); local names = keysOf(lim)
+        f.BuySeeds = (#names > 0) and names or "All"
+        if next(lim) then f.LimitBuySeed = lim end
+    elseif U["Limit Buy Seed"] then
+        f.LimitBuySeed = arr(U["Limit Buy Seed"]); f.BuySeeds = keysOf(U["Limit Buy Seed"])
+    end
+
+    -- plant
+    if U["Auto Plant Seed"] ~= nil then f.Plant = U["Auto Plant Seed"] end
+    if U["Auto Plant"] ~= nil then f.Plant = U["Auto Plant"] end
+    if U["Limit Plant Seed"] ~= nil then
+        f.LimitPlantSeed = arr(U["Limit Plant Seed"]); f.PlantSeeds = keysOf(U["Limit Plant Seed"])
+    end
+    if U["Limit Auto Plant"] ~= nil then f.LimitAutoPlant = tonumber(U["Limit Auto Plant"]) end
+    if U["Blacklist Seed"] ~= nil then f.BlacklistSeeds = arr(U["Blacklist Seed"]) end
+
+    -- plot expansion + gears
+    if U["Expand Plot"] ~= nil then f.Expand = U["Expand Plot"] end
+    if U["Plot Expansions"] ~= nil then f.PlotExpansions = tonumber(U["Plot Expansions"]) end
+    if type(U["Gears"]) == "table" then
+        if U["Gears"]["Buy Gear"] ~= nil then f.BuyGears = arr(U["Gears"]["Buy Gear"]) end
+        if U["Gears"]["Gears To Use"] ~= nil then f.GearsToUse = arr(U["Gears"]["Gears To Use"]) end
+    end
+
+    if U["Auto Collect Seed Packs"] ~= nil then C.Map.CollectSeedPacks = U["Auto Collect Seed Packs"] end
+
+    -- pets (per-variant caps now honored by petTameDecision)
+    if U["Buy Pets"] ~= nil then C.Pets.BuyPets = U["Buy Pets"] end
+    if U["Equip Pets"] ~= nil then C.Pets.EquipLoadout = U["Equip Pets"] end
+    if U["Unlock Pet Slots"] ~= nil then C.Pets.UnlockPetSlots = U["Unlock Pet Slots"] end
+
+    -- favorite-protect (keep these from being sold) + shovel blacklist
+    if U["Favorite"] ~= nil then C.Sell.FavoriteFilter = true; C.Sell.FavoriteByFruit = U["Favorite"] end
+    if U["Blacklist Shovel"] ~= nil then C.Wipe.Blacklist = arr(U["Blacklist Shovel"]) end
+
+    -- mail
+    local m = C.Mail
+    if U["Claim Mail"] ~= nil then m.AutoClaim = U["Claim Mail"] end
+    if U["Auto Claim Mail"] ~= nil then m.AutoClaim = U["Auto Claim Mail"] end
+    if U["Auto Send Mail"] ~= nil then m.AutoSend = U["Auto Send Mail"] end
+    if U["Mail To Username"] ~= nil then m.Usernames = arr(U["Mail To Username"]) end
+    if U["Items To Mail"] ~= nil then m.ItemsByCategory = U["Items To Mail"] end
+
+    -- webhook (listing pet names/rarities / seed mutations implies wanting those notifications)
+    local w = C.Webhook
+    if U["Webhook URL"] ~= nil then w.URL = U["Webhook URL"] end
+    if U["Webhook Pet Name"] ~= nil then w.TamePetNames = arr(U["Webhook Pet Name"]); w.TameNotify = true end
+    if U["Webhook Pet Rarity"] ~= nil then w.TameRarities = arr(U["Webhook Pet Rarity"]); w.TameNotify = true end
+    if U["Webhook Seed Name"] ~= nil then w.SeedNames = arr(U["Webhook Seed Name"]); w.MutationNotify = true end
+    if U["Webhook Note"] ~= nil then w.Note = U["Webhook Note"] end
+    if U["Discord ID"] ~= nil then w.DiscordId = U["Discord ID"] end
+
+    applyGConfig(C, true)
+    pcall(function() Window:Notify({ Title = "Apel Hub", Description = "UserConfig (compat) applied.", Lifetime = 4 }) end)
 end
 
 MacLib:SetFolder("ApelHub")
@@ -3368,6 +3686,7 @@ end)
 task.spawn(function()
     task.wait(1.6)  -- after autoload, so explicit _G config wins
     pcall(applyGConfig)
+    pcall(applyUserConfig)  -- competitor-style getgenv().UserConfig compatibility (applied last)
 end)
 task.spawn(function()
     tabs.Farm:Select()
