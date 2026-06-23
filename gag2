@@ -3601,6 +3601,10 @@ function applyGConfig(C, silent)
         if w.Note ~= nil then webhookNote = tostring(w.Note) end
         if w.DiscordId ~= nil then webhookDiscordId = tostring(w.DiscordId) end
     end
+    if type(C.Misc) == "table" then
+        if C.Misc.StatusOverlay ~= nil then pcall(setStatusOverlay, b(C.Misc.StatusOverlay)) end  -- black info panel
+        if C.Misc.RemoveRollUi ~= nil then removeRollUiEnabled = b(C.Misc.RemoveRollUi) end
+    end
     if type(C.Wipe) == "table" then
         if C.Wipe.Seeds then selectedWipeSeeds = arr(C.Wipe.Seeds) end
         if C.Wipe.Blacklist then wipeBlacklist = arr(C.Wipe.Blacklist) end
@@ -3616,7 +3620,7 @@ function applyUserConfig()
     if type(U) ~= "table" then return end
     local function arr(v) return (type(v) == "table") and v or {} end
     local function keysOf(t) local o = {} for k in pairs(arr(t)) do o[#o + 1] = k end return o end
-    local C = { AutoFarm = {}, Pets = {}, Mail = {}, Sell = {}, Map = {}, Webhook = {}, Fps = {}, Wipe = {} }
+    local C = { AutoFarm = {}, Pets = {}, Mail = {}, Sell = {}, Map = {}, Webhook = {}, Fps = {}, Wipe = {}, Misc = {} }
     local f = C.AutoFarm
 
     if U["FPS Cap"] ~= nil then C.Fps.Cap = tonumber(U["FPS Cap"]) end
@@ -3638,6 +3642,13 @@ function applyUserConfig()
     end
     if U["Limit Auto Plant"] ~= nil then f.LimitAutoPlant = tonumber(U["Limit Auto Plant"]) end
     if U["Blacklist Seed"] ~= nil then f.BlacklistSeeds = arr(U["Blacklist Seed"]) end
+
+    -- harvest (сбор) + sell (продажа) - accept a few common key spellings
+    if U["Auto Harvest"] ~= nil then f.Harvest = U["Auto Harvest"] end
+    if U["Auto Collect"] ~= nil then f.Harvest = U["Auto Collect"] end
+    if U["Auto Collect Fruits"] ~= nil then f.Harvest = U["Auto Collect Fruits"] end
+    if U["Auto Sell"] ~= nil then f.Sell = U["Auto Sell"] end
+    if U["Auto Farm"] ~= nil then f.Harvest = U["Auto Farm"]; f.Sell = U["Auto Farm"] end  -- combined farm+sell
 
     -- plot expansion + gears
     if U["Expand Plot"] ~= nil then f.Expand = U["Expand Plot"] end
@@ -3674,6 +3685,18 @@ function applyUserConfig()
     if U["Webhook Seed Name"] ~= nil then w.SeedNames = arr(U["Webhook Seed Name"]); w.MutationNotify = true end
     if U["Webhook Note"] ~= nil then w.Note = U["Webhook Note"] end
     if U["Discord ID"] ~= nil then w.DiscordId = U["Discord ID"] end
+
+    -- black status panel (dark info screen) + roll UI
+    if U["Status Overlay"] ~= nil then C.Misc.StatusOverlay = U["Status Overlay"] end
+    if U["Black Panel"] ~= nil then C.Misc.StatusOverlay = U["Black Panel"] end
+    if U["Dark Screen"] ~= nil then C.Misc.StatusOverlay = U["Dark Screen"] end
+    if U["Remove Roll UI"] ~= nil then C.Misc.RemoveRollUi = U["Remove Roll UI"] end
+
+    -- fps boost
+    if U["FPS Boost"] ~= nil then C.Fps.Boost = U["FPS Boost"] end
+    if U["Boost FPS"] ~= nil then C.Fps.Boost = U["Boost FPS"] end
+    if U["FPS Max"] ~= nil then C.Fps.Max = U["FPS Max"] end
+    if U["Max FPS Boost"] ~= nil then C.Fps.Max = U["Max FPS Boost"] end
 
     applyGConfig(C, true)
     pcall(function() Window:Notify({ Title = "Apel Hub", Description = "UserConfig (compat) applied.", Lifetime = 4 }) end)
