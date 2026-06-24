@@ -1,3 +1,4 @@
+print("hellow")
 getgenv().UserConfig = {
     ["FPS Cap"] = 0,                                  -- 0 = без капа (у них в примере было 7 = очень низко)
     ["Auto Buy Seed"] = true,
