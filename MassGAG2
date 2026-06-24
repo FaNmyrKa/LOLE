@@ -6,8 +6,9 @@ getgenv().UserConfig = {
     ["FPS Max"]        = true,  -- агрессивный (доп. убивает текстуры/партиклы)
     ["Auto Harvest"] = true,   -- сбор
     ["Auto Sell"]    = true,   -- продажа
-    ["Auto Plant Seed"] = true,
-    ["Limit Plant Seed"] = { ["Carrot"] = 50 }, { ["Bamboo"] = 9999999999999999999999999999999999999999 }, { ["Mushroom"] = 9999999999999999 },        -- ключи = и список посадки
+    ["Auto Plant Seed"]  = true,
+    ["Limit Plant Seed"] = { ["Bamboo"] = 999, ["Mushroom"] = 999, ["Carrot"] = 999 },  -- ключи = что сажать
+    ["Tight Pack"]       = true,
     ["Limit Buy Seed"] = {                            -- ключи = и список покупки
         ["Carrot"] = 5, ["Strawberry"] = 5, ["Bamboo"] = 999999999999999999, ["Mushroom"] = 9999999999,
         ["Moon Bloom"] = 50000, ["Dragon's Breath"] = 50000,
