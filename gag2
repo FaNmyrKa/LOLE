@@ -154,6 +154,7 @@ autoPlantEnabled = false
 selectedPlantSeeds = {}
 plantSpacing = 4
 plantInterval = 5
+tightPackEnabled = false     -- "max density": pack plants as close as the server allows (rejected cells are skipped)
 
 autoHarvestEnabled = false
 harvestInterval = 0.25
@@ -492,6 +493,46 @@ function equipByAttr(attr, wantName)
     if char then pcall(function() t.Parent = char end); task.wait(0.15) end
     return heldToolByAttr(attr)
 end
+-- find the seed tool for `name` in Character/Backpack (by SeedTool attr exact/case-insensitive, or Name)
+-- WITHOUT equipping. Used as a fallback: the server accepts the tool instance even when unequipped.
+function seedToolFor(name)
+    local exact, ci
+    for _, c in ipairs({ LocalPlayer.Character, LocalPlayer:FindFirstChildOfClass("Backpack") }) do
+        if c then for _, t in ipairs(c:GetChildren()) do
+            if t:IsA("Tool") and t:GetAttribute("SeedTool") ~= nil then
+                local st = t:GetAttribute("SeedTool")
+                if st == name or t.Name == name then exact = exact or t
+                elseif tostring(st):lower() == tostring(name):lower() then ci = ci or t end
+            end
+        end end
+    end
+    return exact or ci
+end
+-- robustly equip the seed tool for `name` and return the HELD tool (or nil). Matches the tool by its
+-- SeedTool attribute (exact, then case-insensitive) or its Name, retries the equip, and confirms by
+-- instance identity — so seeds whose display name differs slightly from the SeedTool attr still equip.
+function equipSeedTool(name)
+    local function matches(t)
+        if not (t and t:IsA("Tool")) then return false end
+        local st = t:GetAttribute("SeedTool"); if st == nil then return false end
+        return st == name or t.Name == name or tostring(st):lower() == tostring(name):lower()
+    end
+    -- already holding the right seed?
+    local held = heldToolByAttr("SeedTool")
+    if held and matches(held) then return held end
+    local tool = seedToolFor(name); if not tool then return nil end
+    local hum = humanoid(); if not hum then return nil end
+    for _ = 1, 3 do
+        pcall(function() hum:EquipTool(tool) end); task.wait(0.2)
+        held = heldToolByAttr("SeedTool")
+        if held == tool then return held end
+        pcall(function() tool.Parent = LocalPlayer.Character end); task.wait(0.12)  -- parent-into-char fallback
+        held = heldToolByAttr("SeedTool")
+        if held == tool then return held end
+    end
+    held = heldToolByAttr("SeedTool")
+    return (held and matches(held)) and held or nil  -- only return if it's really our seed
+end
 
 -- PlantArea-tagged parts inside MY plot
 function myPlantAreas()
@@ -505,7 +546,7 @@ end
 -- raycast-confirmed grid of world positions over my PlantArea surfaces
 function plantGrid(spacing)
     local pts, areas = {}, myPlantAreas()
-    spacing = math.max(2, spacing or 4)
+    spacing = math.max(1, spacing or 4)  -- allow tight packing (down to 1 stud) for max density
     local params = RaycastParams.new()
     params.FilterType = Enum.RaycastFilterType.Include
     params.FilterDescendantsInstances = areas
@@ -573,7 +614,7 @@ end
 function ripeHarvests()
     local out = {}
     for _, pr in ipairs(CollectionService:GetTagged("HarvestPrompt")) do
-        if pr:IsA("ProximityPrompt") and pr.Enabled and pr:IsDescendantOf(Workspace) then
+        if pr:IsA("ProximityPrompt") and pr:IsDescendantOf(Workspace) then  -- NOT pr.Enabled: HideCollectProximityPrompts disables prompts but the fruit is still collectable via the remote
             local m = promptCarrier(pr)
             local pid = m and m:GetAttribute("PlantId")
             if pid then
@@ -593,7 +634,7 @@ end
 function stealable()
     local out = {}
     for _, pr in ipairs(CollectionService:GetTagged("StealPrompt")) do
-        if pr:IsA("ProximityPrompt") and pr.Enabled and pr:IsDescendantOf(Workspace) then
+        if pr:IsA("ProximityPrompt") and pr:IsDescendantOf(Workspace) then  -- NOT pr.Enabled: HideCollectProximityPrompts disables prompts but the fruit is still collectable via the remote
             local m = promptCarrier(pr)
             local pid = m and m:GetAttribute("PlantId")
             if pid then
@@ -1644,9 +1685,14 @@ sections.PlantSection:Toggle({
 }, "AutoPlantToggle")
 sections.PlantSection:Slider({
     Name = "Plant Spacing (studs)",
-    Default = 4, Minimum = 2, Maximum = 10, DisplayMethod = "Value", Precision = 0,
+    Default = 4, Minimum = 1, Maximum = 10, DisplayMethod = "Value", Precision = 0,
     Callback = function(v) plantSpacing = v end
 }, "PlantSpacingSlider")
+sections.PlantSection:Toggle({
+    Name = "Tight Pack (max density)",
+    Default = false,
+    Callback = function(state) tightPackEnabled = state end
+}, "TightPackToggle")
 
 sections.HarvestSellSection:Header({ Text = "Harvest & Sell" })
 sections.HarvestSellSection:Toggle({
@@ -2992,8 +3038,11 @@ task.spawn(function()
     while not stopped do
         if autoPlantEnabled and #selectedPlantSeeds > 0 and ActivityPriority:CanStart("AutoPlant") then
             ActivityPriority:SetActivity("AutoPlant")
-            local grid = plantGrid(plantSpacing)
+            local spacing = tightPackEnabled and 1 or plantSpacing  -- tight pack = densest grid (server-rejects are skipped)
+            local grid = plantGrid(spacing)
             if #grid > 0 then
+                local plot = myPlot()
+                local plantsFolder = plot and plot:FindFirstChild("Plants")
                 local occupied = existingPlantPositions()
                 local function isClear(pos)
                     for _, op in ipairs(occupied) do
@@ -3004,27 +3053,40 @@ task.spawn(function()
                 local free = {}
                 for _, p in ipairs(grid) do if isClear(p) then free[#free + 1] = p end end
                 table.clear(plantSeedCount)
-                local fi, planted = 1, 0
+                local fi, planted, attempts = 1, 0, 0
+                -- bound attempts per pass so a dense (tight-pack) grid can't make one pass run forever;
+                -- leftover cells are filled on the next pass. Default 120, or the user's per-pass cap.
+                local attemptCap = (maxAutoPlant > 0 and maxAutoPlant) or 120
                 for _, name in ipairs(selectedPlantSeeds) do
-                    if not autoPlantEnabled or fi > #free then break end
+                    if not autoPlantEnabled or fi > #free or attempts >= attemptCap then break end
                     if maxAutoPlant > 0 and planted >= maxAutoPlant then break end
                     if not inSet(plantBlacklist, name) then
                         local plantLim = tonumber(plantSeedLimits[name])
                         local seedCap = (plantLim and plantLim > 0) and plantLim or nil  -- nil/0 = unlimited
-                        local hum = humanoid(); if not hum then break end
-                        local tool = toolsByAttr("SeedTool", name)[1]
-                        if tool then
-                            pcall(function() hum:EquipTool(tool) end); task.wait(0.22)
-                            while fi <= #free do
+                        local held = equipSeedTool(name) or seedToolFor(name)  -- equipped tool, or unequipped backpack tool (server accepts it)
+                        if held then
+                            -- mirror the real client: pass the tool's actual SeedTool attribute value as the seed name
+                            local seedArg = held:GetAttribute("SeedTool") or name
+                            while fi <= #free and attempts < attemptCap do
                                 if not autoPlantEnabled then break end
                                 if maxAutoPlant > 0 and planted >= maxAutoPlant then break end
                                 if seedCap and (plantSeedCount[name] or 0) >= seedCap then break end
-                                local held = heldToolByAttr("SeedTool")
-                                if not held or held:GetAttribute("SeedTool") ~= name then break end
-                                pcall(function() PlantSeed:Fire(free[fi], name, held) end)
-                                plantSeedCount[name] = (plantSeedCount[name] or 0) + 1
-                                planted = planted + 1
-                                fi = fi + 1; task.wait(0.12)
+                                held = heldToolByAttr("SeedTool") or seedToolFor(name)
+                                if not held then break end
+                                seedArg = held:GetAttribute("SeedTool") or name
+                                local pos = free[fi]; fi = fi + 1; attempts = attempts + 1
+                                local before = plantsFolder and #plantsFolder:GetChildren() or nil
+                                pcall(function() PlantSeed:Fire(pos, seedArg, held) end)
+                                task.wait(0.16)
+                                -- VERIFY it actually landed: the server silently rejects some placements (e.g.
+                                -- tall single-harvest plants like Bamboo/Mushroom placed too close). Harvest is
+                                -- lower priority so it can't remove plants mid-pass -> a count increase is reliable.
+                                -- A rejected cell is skipped (move to the next) instead of being counted as planted.
+                                local landed = (before == nil) or (#plantsFolder:GetChildren() > before)
+                                if landed then
+                                    plantSeedCount[name] = (plantSeedCount[name] or 0) + 1
+                                    planted = planted + 1
+                                end
                             end
                         end
                     end
@@ -3466,6 +3528,7 @@ function applyGConfig(C, silent)
         if f.Harvest ~= nil then autoHarvestEnabled = b(f.Harvest) end
         if f.Sell ~= nil then autoSellEnabled = b(f.Sell) end
         if f.Plant ~= nil then autoPlantEnabled = b(f.Plant) end
+        if f.TightPack ~= nil then tightPackEnabled = b(f.TightPack) end
         if f.Expand ~= nil then autoExpandEnabled = b(f.Expand) end
         if f.Daily ~= nil then autoDailyEnabled = b(f.Daily) end
         if f.PlantSeeds ~= nil then selectedPlantSeeds = arr(f.PlantSeeds) end
@@ -3642,6 +3705,8 @@ function applyUserConfig()
     end
     if U["Limit Auto Plant"] ~= nil then f.LimitAutoPlant = tonumber(U["Limit Auto Plant"]) end
     if U["Blacklist Seed"] ~= nil then f.BlacklistSeeds = arr(U["Blacklist Seed"]) end
+    if U["Tight Pack"] ~= nil then f.TightPack = U["Tight Pack"] end
+    if U["Max Density"] ~= nil then f.TightPack = U["Max Density"] end
 
     -- harvest (сбор) + sell (продажа) - accept a few common key spellings
     if U["Auto Harvest"] ~= nil then f.Harvest = U["Auto Harvest"] end
