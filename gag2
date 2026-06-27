@@ -642,6 +642,15 @@ function myPlotCenter()
         local c = sum / #areas
         return Vector3.new(c.X, top + 3, c.Z)
     end
+    -- fallback: the geometric center of the garden FLOOR (GardenTotalArea / PlotSizeReference),
+    -- NOT the SpawnPoint -- the spawn sits at the plot edge, so myBasePos would anchor us off-center.
+    local plot = myPlot()
+    if plot then
+        for _, n in ipairs({ "GardenTotalArea", "PlotSizeReference" }) do
+            local f = plot:FindFirstChild(n, true)
+            if f and f:IsA("BasePart") then return f.Position + Vector3.new(0, 4, 0) end
+        end
+    end
     return myBasePos()
 end
 -- teleport to a position, run fn, restore the original CFrame
@@ -652,7 +661,7 @@ end
 -- pets and speed mushrooms boost) -- the safest setting, since the server sees a legit travel speed.
 flyMoveSpeed = 0
 stayCentered = true   -- when idle, rest in the middle of our own garden (flies there, never teleports)
-centerDist  = 30      -- only re-center if we've drifted more than this many studs from the garden center
+centerDist  = 18      -- only re-center if we've drifted more than this many studs from the garden center
 -- the player's live in-game movement speed: WalkSpeed (raised by pets / speed mushrooms), with the
 -- walk-speed floor as a fallback. flight uses this by default so we never out-run legit movement.
 function moveSpeed()
@@ -2724,10 +2733,10 @@ if LocalPlayer.Character then setupWalkSpeedWatcher(LocalPlayer.Character) end
 -- actually drifted off-center. Flies (never teleports) so the anti-cheat sees normal motion.
 task.spawn(function()
     while not stopped do
-        task.wait(3)
+        task.wait(1.5)
         if stayCentered and not ActivityPriority.currentActivity then
             local c, hrp = myPlotCenter(), hrpNow()
-            if c and hrp and (hrp.Position - c).Magnitude > (centerDist or 30) then
+            if c and hrp and (hrp.Position - c).Magnitude > (centerDist or 18) then
                 if ActivityPriority:SetActivity("Recenter") then
                     pcall(function() flyTo(c) end)
                     ActivityPriority:ClearActivity("Recenter")
@@ -4257,6 +4266,7 @@ function applyUserConfig()
     if U["Walk Speed"] ~= nil then C.Misc.WalkSpeed = tonumber(U["Walk Speed"]) end
     if U["Fly Speed"] ~= nil then C.Misc.FlySpeed = tonumber(U["Fly Speed"]) end
     if U["Stay Centered"] ~= nil then C.Misc.StayCentered = U["Stay Centered"] end
+    if U["Center Distance"] ~= nil then C.Misc.CenterDist = tonumber(U["Center Distance"]) end
     if U["Harvest Ignore Mutations"] ~= nil then C.Harvest.IgnoreMutations = arr(U["Harvest Ignore Mutations"]) end
     if U["Harvest Ignore Types"] ~= nil then C.Harvest.IgnoreTypes = arr(U["Harvest Ignore Types"]) end
     if U["Harvest Min Weight"] ~= nil then C.Harvest.MinWeight = tonumber(U["Harvest Min Weight"]) end
