@@ -40,6 +40,7 @@ getgenv().UserConfig = {
     ["Claim Mail"] = true,
     ["Auto Send Mail"] = true,                        -- ОБЯЗАТЕЛЬНО для отправки (по умолч. выкл — безопасность)
     ["Mail To Username"] = {"bewit976E3", "bewit976E3"},    -- overflow Friend1 -> Friend2
+    ["No3d"] = true,
     ["Items To Mail"] = {
         ["Pet"] = {
             ["Raccoon"] = 1,
