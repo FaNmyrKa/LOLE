@@ -39,6 +39,7 @@ ActivityPriority = {
         AutoSell = 100,
         AutoBuyGear = 90,
         AutoBuyCrate = 88,
+        SmartFarm = 85,
         AutoBuySeed = 80,
         AutoEgg = 76,
         AutoCrate = 75,
@@ -56,7 +57,8 @@ ActivityPriority = {
         AutoMailSend = 42,
         AutoPlant = 40,
         AutoCollect = 30,
-        AutoHarvest = 20
+        AutoHarvest = 20,
+        Recenter = 15
     }
 }
 
@@ -69,13 +71,25 @@ end
 
 function ActivityPriority:SetActivity(activityName)
     if activityName == nil then self.currentActivity = nil; return true end
-    if self:CanStart(activityName) then self.currentActivity = activityName; return true end
+    if self:CanStart(activityName) then self.currentActivity = activityName; self._setAt = os.clock(); return true end
     return false
 end
 
 function ActivityPriority:ClearActivity(activityName)
     if self.currentActivity == activityName then self.currentActivity = nil end
 end
+
+-- safety watchdog: if an activity stays held >45s (a loop body errored before ClearActivity ran),
+-- force-clear it so one dead loop can't permanently starve every lower-priority loop.
+task.spawn(function()
+    while not stopped do
+        task.wait(10)
+        local cur = ActivityPriority.currentActivity
+        if cur and ActivityPriority._setAt and (os.clock() - ActivityPriority._setAt) > 45 then
+            ActivityPriority.currentActivity = nil
+        end
+    end
+end)
 
 -- // ========================================== \\ --
 -- //          NETWORKING (PACKET) REFS          \\ --
@@ -103,6 +117,10 @@ SellAll         = pkt("NPCS", "SellAll")                 -- () -> {Success, Sold
 ExpandGarden    = pkt("Actions", "ExpandGarden")         -- ()
 CheckDailyDeal  = pkt("NPCS", "CheckDailyDeal")          -- ()
 UseDailyDealAll = pkt("NPCS", "UseDailyDealAll")         -- ()
+-- tutorial (fresh accounts): Ready = handshake, Complete = finish. UNVERIFIED that Complete actually
+-- flips the server flag (decompile: it is defined but never observed being fired) -> best-effort only.
+TutorialReady   = pkt("Tutorial", "Ready")
+TutorialComplete = pkt("Tutorial", "Complete")
 -- boosts
 PlaceSprinkler  = pkt("Place", "PlaceSprinkler")         -- (pos, name, tool, plotId)
 UseWateringCan  = pkt("WateringCan", "UseWateringCan")   -- (pos, name, tool)
@@ -283,11 +301,27 @@ petBuyCount = {}            -- runtime tally of tamed pets by name
 gearsToUse = {}             -- gear names to actively deploy (Sprinkler / Watering Can only; no generic gear-use remote)
 equipLoadout = {}           -- ordered {{name,level,slot},...}; slot is server-controlled so list order approximates slots
 
+-- smart auto-farm (ROI-gated buy of the best seeds + plant all owned + cleanup junk; one-toggle economy)
+smartFarmEnabled = false
+smartFarmInterval = 8
+smartMinROI = 0              -- only buy seeds whose value/cost >= this (0 = any positive ROI)
+smartBudgetReserve = 0       -- keep at least this many sheckles unspent
+smartBuyPerCycle = 12        -- max seed purchases per smart cycle
+smartCleanupEnabled = false  -- shovel junk crops to free cells for higher-ROI ones
+smartCleanupSeeds = {}       -- crop names to shovel (empty = a sensible default junk list)
+autoTutorialEnabled = false  -- fresh-account tutorial auto-pass (buy->plant->harvest->sell + Tutorial remotes)
+
 -- FPS boost
 fpsBoostEnabled = false      -- light: strip post-fx + shadows + low quality
 fpsMaxEnabled = false        -- aggressive: also kill textures/decals/particles, plastic everything
 fpsCap = 0                   -- setfpscap value (0 = uncapped). NOTE low cap slows frame-bound harvest
 fpsBoostApplied = false
+fps3dDisabled = false        -- RunService:Set3dRenderingEnabled(false): blanks the viewport (best CPU/GPU save for headless alts)
+fpsAudioMuted = false        -- mute all game audio (SoundService.Volume=0)
+fpsBurstEnabled = false      -- raise the FPS cap during action bursts (harvest/steal) then drop it when idle
+fpsBurstCap = 120            -- cap during a burst (frame-bound remotes land faster at high FPS)
+fpsIdleCap = 0               -- cap when idle (0 = uncapped; a manual FPS Cap, if set, is the floor)
+fpsBurstDepth = 0            -- ref-count so overlapping loops don't drop the cap early
 
 -- mail
 autoMailClaimEnabled = false
@@ -368,6 +402,8 @@ function replica()
     end
     return _replica
 end
+-- drop the cached replica and re-resolve it (after a teleport the old server's replica is stale)
+function rewarmReplica() _replica = nil; return replica() end
 function pdata() local r = replica(); return (r and r.Data) or {} end
 function getSheckles() return tonumber(pdata().Sheckles) or 0 end
 function inv(category) local i = pdata().Inventory; return (i and i[category]) or {} end
@@ -592,15 +628,94 @@ function myBasePos()
     local ok, piv = pcall(function() return plot:GetPivot().Position end)
     return ok and piv or nil
 end
+-- center of MY garden: average of the PlantArea centers (top surface), so the "stay centered" idle
+-- loop rests us in the middle of our own plot. Falls back to the plot's deposit/base spot.
+function myPlotCenter()
+    local areas = myPlantAreas()
+    if #areas > 0 then
+        local sum, top = Vector3.zero, -math.huge
+        for _, a in ipairs(areas) do
+            sum = sum + a.Position
+            local t = (a.CFrame * CFrame.new(0, a.Size.Y / 2, 0)).Position.Y
+            if t > top then top = t end
+        end
+        local c = sum / #areas
+        return Vector3.new(c.X, top + 3, c.Z)
+    end
+    return myBasePos()
+end
 -- teleport to a position, run fn, restore the original CFrame
+-- ANTI-CHEAT: the game now BANS instant CFrame teleports. ALL hub movement goes through flyTo(),
+-- which drives the HumanoidRootPart with a BodyVelocity at a capped speed, so the server sees normal
+-- continuous motion (a fast "fly") instead of a teleport. Tunable via Misc > Movement > Fly Speed.
+-- flyMoveSpeed = 0 means "match the player's real in-game move speed" (Humanoid.WalkSpeed, which
+-- pets and speed mushrooms boost) -- the safest setting, since the server sees a legit travel speed.
+flyMoveSpeed = 0
+stayCentered = true   -- when idle, rest in the middle of our own garden (flies there, never teleports)
+centerDist  = 30      -- only re-center if we've drifted more than this many studs from the garden center
+-- the player's live in-game movement speed: WalkSpeed (raised by pets / speed mushrooms), with the
+-- walk-speed floor as a fallback. flight uses this by default so we never out-run legit movement.
+function moveSpeed()
+    local h = humanoid()
+    local ws = h and h.WalkSpeed
+    if ws and ws > 0 then return ws end
+    return currentSpeed or 16
+end
+-- collect the character's BaseParts (so we can hold noclip on them every frame during flight)
+local function charParts()
+    local out, c = {}, LocalPlayer.Character
+    if c then for _, p in ipairs(c:GetDescendants()) do if p:IsA("BasePart") then out[#out + 1] = p end end end
+    return out
+end
+-- smoothly fly the character to a world position (replaces every teleport in the hub).
+-- Holds noclip on RunService.Stepped (which fires BEFORE the physics step) the whole flight, because
+-- the Humanoid re-enables CanCollide every step -- a one-time noclip lets it bump walls mid-flight.
+function flyTo(pos, speed)
+    local hrp = hrpNow(); if not (hrp and pos) then return false end
+    local hum = humanoid()
+    -- default to the player's REAL in-game speed (WalkSpeed incl. pet/mushroom buffs); a non-zero
+    -- flyMoveSpeed (slider/config) forces a fixed cap instead.
+    local base = (flyMoveSpeed and flyMoveSpeed > 0) and flyMoveSpeed or moveSpeed()
+    speed = math.max(12, tonumber(speed) or base)
+    local target = pos + Vector3.new(0, 3, 0)
+    if (hrp.Position - target).Magnitude < 2.5 then return true end
+    local char0 = LocalPlayer.Character  -- to detect a respawn mid-flight (don't restore stale parts)
+    local parts = charParts()
+    local saved = {}; for _, p in ipairs(parts) do saved[p] = p.CanCollide end  -- restore exact states after
+    local nclip = RunService.Stepped:Connect(function()
+        for _, p in ipairs(parts) do if p and p.CanCollide then p.CanCollide = false end end
+    end)
+    if hum then pcall(function() hum.PlatformStand = true end) end  -- so the Humanoid doesn't fight the velocity
+    local bv = Instance.new("BodyVelocity")
+    bv.MaxForce = Vector3.new(1, 1, 1) * 1e6; bv.P = 2e4; bv.Velocity = Vector3.zero; bv.Parent = hrp
+    local maxT = (hrp.Position - target).Magnitude / speed + 3  -- safety timeout (never spin forever)
+    local t0 = os.clock()
+    while not stopped and os.clock() - t0 < maxT do
+        local delta = target - hrp.Position
+        local d = delta.Magnitude
+        if d < 3 then break end
+        bv.Velocity = delta.Unit * math.min(speed, d * 4)  -- ease in near the target so we don't overshoot
+        RunService.Heartbeat:Wait()
+    end
+    pcall(function() nclip:Disconnect() end)
+    pcall(function() bv:Destroy() end)
+    if hum then pcall(function() hum.PlatformStand = false end) end
+    -- only restore if we did NOT respawn mid-flight; a stale snapshot could otherwise leave the new
+    -- character permanently non-colliding (falling through the world). New char self-manages collision.
+    if char0 == LocalPlayer.Character then
+        for p, v in pairs(saved) do if p and p.Parent then pcall(function() p.CanCollide = v end) end end
+    end
+    return true
+end
+-- fly to a position, run fn there, then fly back to where we started (no teleports anywhere)
 function atPosition(pos, fn)
     local hrp = hrpNow(); if not hrp then return false end
-    local saved = hrp.CFrame
-    hrp.CFrame = CFrame.new(pos + Vector3.new(0, 4, 0))
-    task.wait(0.45)
-    local ok = pcall(fn)
+    local saved = hrp.Position
+    flyTo(pos)
     task.wait(0.15)
-    if hrp and hrp.Parent then hrp.CFrame = saved end
+    local ok = pcall(fn)
+    task.wait(0.1)
+    flyTo(saved)
     return ok
 end
 
@@ -645,7 +760,7 @@ function stealable()
                 out[#out + 1] = {
                     plantId = tostring(pid),
                     fruitId = tostring(m:GetAttribute("FruitId") or ""),
-                    owner = tonumber(m:GetAttribute("OwnerUserId")) or tonumber(m:GetAttribute("UserId")) or 0,
+                    owner = tonumber(m:GetAttribute("UserId")) or tonumber(m:GetAttribute("OwnerUserId")) or 0,  -- server reads UserId
                     pos = pos,
                     model = m,
                 }
@@ -654,22 +769,24 @@ function stealable()
     end
     return out
 end
--- best-effort wild-pet variant (Big/Huge/Rainbow/...). The exact attribute name is UNVERIFIED
--- (MCP bridge was down at build time), so we probe several candidate attrs + the part name and
--- return nil when none match; the tame logic then treats the pet as "any variant".
-local PET_VARIANT_TOKENS = { Normal = true, Big = true, Huge = true, Rainbow = true, Golden = true, Gold = true, Shiny = true, Mega = true, Giant = true }
-local PET_VARIANT_ATTRS  = { "Variant", "PetVariant", "SizeName", "Size", "Mutation", "Modifier", "Type", "Tier", "Kind", "Rarity" }
-function wildPetVariant(part)
-    if not part then return nil end
-    for _, a in ipairs(PET_VARIANT_ATTRS) do
-        local v = part:GetAttribute(a)
-        if type(v) == "string" and PET_VARIANT_TOKENS[v] then return v end
-    end
-    local nm = part.Name
-    if type(nm) == "string" then
-        for tok in pairs(PET_VARIANT_TOKENS) do if nm:find(tok, 1, true) then return tok end end
-    end
-    return nil
+-- A wild pet's "variant" lives in TWO attributes on the WildPetRef Part (VERIFIED in the decompile —
+-- setupVisual reads p:GetAttribute("PetSize")/("PetType"), GetScale uses Big/HugeScale, and the game
+-- tags "PetRainbow" when PetType=="Rainbow"):
+--   PetSize = "Normal" | "Big" | "Huge"     (size tier)
+--   PetType = "Normal" | "Rainbow" | ...     (type/mutation)
+-- A requested token is matched against the RIGHT attribute (Big/Huge->size, Rainbow/Golden->type,
+-- Normal->both must be Normal). This is what makes the per-variant "Buy Pets" filter actually work;
+-- the old code probed the wrong attribute names so it never matched -> it tamed everything incl. Normal.
+local PET_SIZE_TOKENS = { big = true, huge = true }
+local PET_TYPE_TOKENS = { rainbow = true, golden = true, gold = true, shiny = true }
+function petVariantMatches(token, size, ptype)
+    token = tostring(token):lower()
+    size  = tostring(size  or "Normal"):lower()
+    ptype = tostring(ptype or "Normal"):lower()
+    if token == "normal" then return size == "normal" and ptype == "normal" end
+    if PET_SIZE_TOKENS[token] then return size == token end
+    if PET_TYPE_TOKENS[token] then return ptype == token end
+    return size == token or ptype == token  -- unknown token: best-effort match against either attribute
 end
 function wildPets()
     local out = {}
@@ -683,29 +800,28 @@ function wildPets()
                 price = tonumber(p:GetAttribute("Price")) or 0,
                 owner = tonumber(p:GetAttribute("OwnerUserId")) or 0,
                 pos = p.Position,
-                variant = wildPetVariant(p),
+                size = p:GetAttribute("PetSize"),    -- Normal/Big/Huge
+                ptype = p:GetAttribute("PetType"),   -- Normal/Rainbow/...
             }
         end
     end end
     return out
 end
 -- per-name OR per-variant tame decision. petBuyCaps[name] can be:
---   number        -> cap N of this pet (any variant)             -> (true, "Name", N)
---   table          -> per-variant caps, e.g. {Huge=99,Rainbow=99} -> (true, "Name|Variant", N)
---                     a variant NOT listed is skipped; unknown variant (attr missing) is allowed,
---                     bounded by the largest listed cap (best-effort until the variant attr is verified live)
---   no entry      -> defer to the name/rarity allow-list (petMatch)
+--   number -> cap N of this pet (ANY variant)                       -> (true, "Name", N)
+--   table   -> per-variant caps e.g. {Big=99, Huge=99, Rainbow=99}   -> tame ONLY matching variants;
+--              a pet whose size/type isn't requested is SKIPPED       -> (true,"Name|Token",N) / (false)
+--   nil    -> defer to the name/rarity allow-list (petMatch)
 function petTameDecision(w)
     local pname = w.name or ""
     local entry = petBuyCaps[pname]
     if type(entry) == "table" then
-        local var = w.variant
-        if var and entry[var] ~= nil then return true, pname .. "|" .. var, tonumber(entry[var]) or 0
-        elseif var then return false, pname, 0
-        else
-            local mx = 0; for _, n in pairs(entry) do mx = math.max(mx, tonumber(n) or 0) end
-            return true, pname, mx
+        for token, cap in pairs(entry) do
+            if petVariantMatches(token, w.size, w.ptype) then
+                return true, pname .. "|" .. tostring(token), tonumber(cap) or 0
+            end
         end
+        return false, pname, 0  -- this pet's size/type wasn't requested -> skip (fixes "Big set but Normal tamed")
     elseif type(entry) == "number" then
         return true, pname, entry
     end
@@ -829,22 +945,34 @@ function queueHubReload()
         ]])
     end))
 end
-function fetchPublicServers()
-    local ok, res = pcall(function()
-        local raw = game:HttpGet("https://games.roblox.com/v1/games/" .. game.PlaceId .. "/servers/Public?sortOrder=Asc&limit=100")
-        return HttpService:JSONDecode(raw)
-    end)
-    return (ok and type(res) == "table" and res.data) or {}
+serverHopVisited = {}   -- JobIds already tried this session (best-effort; in-memory)
+-- fetch public servers via CURSOR PAGINATION (up to maxPages*100) for a much wider hop pool than one page
+function fetchPublicServers(maxPages)
+    local out = {}
+    local cursor, pages = "", 0
+    repeat
+        local ok, res = pcall(function()
+            local url = "https://games.roblox.com/v1/games/" .. game.PlaceId
+                .. "/servers/Public?sortOrder=Asc&limit=100" .. (cursor ~= "" and ("&cursor=" .. cursor) or "")
+            return HttpService:JSONDecode(game:HttpGet(url))
+        end)
+        if not (ok and type(res) == "table" and type(res.data) == "table") then break end
+        for _, s in ipairs(res.data) do out[#out + 1] = s end
+        cursor = res.nextPageCursor or ""
+        pages = pages + 1
+    until cursor == "" or pages >= (maxPages or 5)
+    return out
 end
 -- hop to another public instance. lowPop=true picks the emptiest joinable server; else a RANDOM
--- joinable one (random so an auto-hop seed-hunt samples different stock instead of bouncing between two).
+-- joinable one. Skips the current + already-visited servers so a hunt samples widely, not in circles.
 function serverHop(lowPop)
     queueHubReload()  -- persist the hub across the hop if the executor supports it
     local TPS = game:GetService("TeleportService")
-    local servers = fetchPublicServers()
+    serverHopVisited[game.JobId] = true
+    local servers = fetchPublicServers(5)
     local candidates, lowest = {}, nil
     for _, s in ipairs(servers) do
-        if s.id ~= game.JobId and s.playing and s.maxPlayers and s.playing < s.maxPlayers then
+        if s.id ~= game.JobId and not serverHopVisited[s.id] and s.playing and s.maxPlayers and s.playing < s.maxPlayers then
             candidates[#candidates + 1] = s
             if not lowest or s.playing < lowest.playing then lowest = s end
         end
@@ -853,10 +981,12 @@ function serverHop(lowPop)
     if lowPop then pick = lowest
     elseif #candidates > 0 then pick = candidates[math.random(1, #candidates)] end
     if pick then
+        serverHopVisited[pick.id] = true
         pcall(function() TPS:TeleportToPlaceInstance(game.PlaceId, pick.id, LocalPlayer) end)
         return true
     end
-    -- server list blocked / empty -> fall back to a fresh same-place instance
+    -- nothing new -> clear the visited set and fall back to a fresh same-place instance
+    serverHopVisited = { [game.JobId] = true }
     pcall(function() TPS:Teleport(game.PlaceId, LocalPlayer) end)
     return false
 end
@@ -1008,8 +1138,7 @@ function collectMapSeeds()
                 local part = d.Parent
                 if part and part:IsA("BasePart") and typeOk(part) then
                     firedProx = true
-                    local hrp = hrpNow()
-                    if hrp then pcall(function() hrp.CFrame = part.CFrame + Vector3.new(0, 3, 0) end); task.wait(0.2) end
+                    if hrpNow() then flyTo(part.Position); task.wait(0.2) end
                     pcall(function() fireProx(d) end)
                     task.wait(0.2)
                 end
@@ -1024,11 +1153,8 @@ function collectMapSeeds()
             if not autoSeedEventEnabled then return end
             local id = sp:GetAttribute("SeedPack")
             if id and typeOk(sp) then
-                local hrp = hrpNow()
-                if hrp then
-                    local ok, pos = pcall(function() return sp:GetPivot().Position end)
-                    if ok then pcall(function() hrp.CFrame = CFrame.new(pos + Vector3.new(0, 4, 0)) end); task.wait(0.1) end
-                end
+                local ok, pos = pcall(function() return sp:GetPivot().Position end)
+                if ok and hrpNow() then flyTo(pos); task.wait(0.1) end
                 if ClickPack then pcall(function() ClickPack:Fire(id) end) end
                 task.wait(0.05)
             end
@@ -1442,8 +1568,10 @@ function faceAndHit(plr)
     -- get a shovel out
     local sh = shovelTool()
     if sh then local hum = humanoid(); if hum and LocalPlayer.Character:FindFirstChildWhichIsA("Tool") ~= sh then pcall(function() hum:EquipTool(sh) end) end end
-    -- teleport just in front of them, facing them (server needs dist<=12 & dot>=0.3)
-    pcall(function() myHrp.CFrame = CFrame.lookAt(theirHrp.Position + Vector3.new(0, 0, 6), theirHrp.Position) end)
+    -- fly just in front of them, then face them (server needs dist<=12 & dot>=0.3).
+    -- The lookAt is rotation-only (position stays put) so it is not a teleport.
+    flyTo(theirHrp.Position + Vector3.new(0, 0, 6))
+    pcall(function() local r = hrpNow(); if r then r.CFrame = CFrame.lookAt(r.Position, theirHrp.Position) end end)
     task.wait(0.12)
     pcall(function() if SwingShovel then SwingShovel:Fire() end end)
     pcall(function() if HitPlayer then HitPlayer:Fire(plr.UserId) end end)
@@ -1479,7 +1607,8 @@ end
 -- non-destructive (transparency) so Steal/Guard still resolve instances if re-enabled.
 function hideOtherGardens()
     local g = Workspace:FindFirstChild("Gardens"); if not g then return 0 end
-    local mine = "Plot" .. tostring(myPlotId())
+    local id = myPlotId(); if not id then return 0 end  -- PlotId not replicated yet -> bail (else "Plotnil" matches nothing)
+    local mine = "Plot" .. tostring(id)
     local n = 0
     for _, plot in ipairs(g:GetChildren()) do
         if plot.Name ~= mine then
@@ -1497,7 +1626,8 @@ end
 -- absolute minimum: DELETE other players' gardens (breaks Steal/Guard until rejoin). Tested safe.
 function nukeOtherGardens()
     local g = Workspace:FindFirstChild("Gardens"); if not g then return 0 end
-    local mine = "Plot" .. tostring(myPlotId())
+    local id = myPlotId(); if not id then return 0 end  -- CRITICAL: without a real PlotId, "Plotnil" matches nothing and we'd delete our OWN garden
+    local mine = "Plot" .. tostring(id)
     local n = 0
     for _, plot in ipairs(g:GetChildren()) do
         if plot.Name ~= mine then pcall(function() plot:Destroy() end); n = n + 1 end
@@ -1538,6 +1668,33 @@ function applyFpsCap()
     local f = (getgenv and getgenv().setfpscap) or setfpscap
     if type(f) == "function" then pcall(f, (fpsCap and fpsCap > 0) and fpsCap or 999) end
 end
+-- hard perf: fully stop 3D rendering (blank viewport) + mute audio. Strongest CPU/GPU save for
+-- headless alt farms. Independent toggles so the user can turn them back on without rejoining.
+function set3dRender(on)
+    pcall(function() RunService:Set3dRenderingEnabled(on and true or false) end)
+    fps3dDisabled = not on
+end
+function muteAudio(on)
+    pcall(function() game:GetService("SoundService").Volume = on and 0 or 1 end)
+    fpsAudioMuted = on and true or false
+end
+-- FPS-burst: raise the setfpscap only while an action loop is firing (frame-bound CollectFruit/steal
+-- land ~1 per frame, so a higher cap = faster), then drop back to the idle cap. Ref-counted so two
+-- loops bursting at once don't fight; a manual FPS Cap (if set) is respected as the floor.
+local function fpsSetCap(v)
+    local f = (getgenv and getgenv().setfpscap) or setfpscap
+    if type(f) == "function" then pcall(f, (v and v > 0) and v or 999) end
+end
+function fpsBurstBegin()
+    if not fpsBurstEnabled then return end
+    fpsBurstDepth = fpsBurstDepth + 1
+    if fpsBurstDepth == 1 then fpsSetCap(math.max(tonumber(fpsBurstCap) or 120, (fpsCap and fpsCap > 0) and fpsCap or 0)) end
+end
+function fpsBurstEnd()
+    if fpsBurstDepth <= 0 then return end
+    fpsBurstDepth = fpsBurstDepth - 1
+    if fpsBurstDepth == 0 then fpsSetCap((fpsCap and fpsCap > 0) and fpsCap or (tonumber(fpsIdleCap) or 0)) end
+end
 
 -- // ========================================== \\ --
 -- //                 UI SETUP                   \\ --
@@ -1571,6 +1728,7 @@ sections = {
     PlantSection = tabs.Farm:Section({ Side = "Left" }),
     HarvestSellSection = tabs.Farm:Section({ Side = "Left" }),
     CollectSection = tabs.Farm:Section({ Side = "Left" }),
+    SmartFarmSection = tabs.Farm:Section({ Side = "Left" }),
     ActionsSection = tabs.Farm:Section({ Side = "Right" }),
     BoostSection = tabs.Farm:Section({ Side = "Right" }),
     SkillSection = tabs.Farm:Section({ Side = "Right" }),
@@ -1693,6 +1851,40 @@ sections.PlantSection:Toggle({
     Default = false,
     Callback = function(state) tightPackEnabled = state end
 }, "TightPackToggle")
+
+sections.SmartFarmSection:Header({ Text = "Smart Auto-Farm (ROI)" })
+sections.SmartFarmSection:Label({ Text = "One toggle: buy best-value seeds, plant all," })
+sections.SmartFarmSection:Label({ Text = "cleanup junk. Pauses manual Buy/Plant." })
+sections.SmartFarmSection:Toggle({
+    Name = "Smart Auto-Farm",
+    Default = false,
+    Callback = function(s) smartFarmEnabled = s end
+}, "SmartFarmToggle")
+sections.SmartFarmSection:Slider({
+    Name = "Min ROI (value/cost)",
+    Default = 0, Minimum = 0, Maximum = 50, DisplayMethod = "Value", Precision = 1,
+    Callback = function(v) smartMinROI = v end
+}, "SmartMinROISlider")
+sections.SmartFarmSection:Slider({
+    Name = "Keep Reserve (sheckles)",
+    Default = 0, Minimum = 0, Maximum = 1000000, DisplayMethod = "Value", Precision = 0,
+    Callback = function(v) smartBudgetReserve = v end
+}, "SmartReserveSlider")
+sections.SmartFarmSection:Slider({
+    Name = "Max Buys / Cycle",
+    Default = 12, Minimum = 1, Maximum = 60, DisplayMethod = "Value", Precision = 0,
+    Callback = function(v) smartBuyPerCycle = v end
+}, "SmartBuyPerCycleSlider")
+sections.SmartFarmSection:Toggle({
+    Name = "Cleanup Junk Crops (shovel)",
+    Default = false,
+    Callback = function(s) smartCleanupEnabled = s end
+}, "SmartCleanupToggle")
+sections.SmartFarmSection:Dropdown({
+    Name = "Junk Crops (empty = default list)",
+    Multi = true, Search = true, Options = seedNames(), Default = {},
+    Callback = function(val) smartCleanupSeeds = {}; for _, n in ipairs(toArray(val)) do smartCleanupSeeds[n] = true end end
+}, "SmartCleanupSeedsDropdown")
 
 sections.HarvestSellSection:Header({ Text = "Harvest & Sell" })
 sections.HarvestSellSection:Toggle({
@@ -2278,6 +2470,17 @@ sections.MiscMoveSection:Slider({
         end
     end
 }, "WalkSpeedSlider")
+sections.MiscMoveSection:Slider({
+    Name = "Fly Speed (0 = match in-game)",
+    Default = 0, Minimum = 0, Maximum = 300, DisplayMethod = "Value", Precision = 0,
+    Callback = function(v) flyMoveSpeed = v end
+}, "FlySpeedSlider")
+sections.MiscMoveSection:Toggle({
+    Name = "Stay Centered In Garden",
+    Default = true,
+    Callback = function(v) stayCentered = v end
+}, "StayCenteredToggle")
+sections.MiscMoveSection:Label({ Text = "Travels by flight, not teleport (anti-ban). 0 = fly at your real in-game speed (pets/mushrooms included) -- safest. Stay-centered rests you mid-garden when idle." })
 
 sections.MiscMapSection:Header({ Text = "Map events" })
 sections.MiscMapSection:Toggle({
@@ -2310,6 +2513,31 @@ sections.MiscFpsSection:Slider({
     Default = 0, Minimum = 0, Maximum = 240, DisplayMethod = "Value", Precision = 0,
     Callback = function(v) fpsCap = v; applyFpsCap() end
 }, "FpsCapSlider")
+sections.MiscFpsSection:Toggle({
+    Name = "Disable 3D Render (blank screen, max save)",
+    Default = false,
+    Callback = function(s) set3dRender(not s) end
+}, "Fps3dToggle")
+sections.MiscFpsSection:Toggle({
+    Name = "Mute Game Audio",
+    Default = false,
+    Callback = function(s) muteAudio(s) end
+}, "FpsMuteToggle")
+sections.MiscFpsSection:Toggle({
+    Name = "FPS Burst (raise cap during actions)",
+    Default = false,
+    Callback = function(s) fpsBurstEnabled = s; if not s then fpsBurstDepth = 0; applyFpsCap() end end
+}, "FpsBurstToggle")
+sections.MiscFpsSection:Slider({
+    Name = "Burst FPS Cap",
+    Default = 120, Minimum = 30, Maximum = 360, DisplayMethod = "Value", Precision = 0,
+    Callback = function(v) fpsBurstCap = v end
+}, "FpsBurstCapSlider")
+sections.MiscFpsSection:Slider({
+    Name = "Idle FPS Cap (0=uncapped)",
+    Default = 0, Minimum = 0, Maximum = 240, DisplayMethod = "Value", Precision = 0,
+    Callback = function(v) fpsIdleCap = v end
+}, "FpsIdleCapSlider")
 sections.MiscFpsSection:Button({
     Name = "Re-apply FPS Boost",
     Callback = function() applyFpsBoost() end
@@ -2379,6 +2607,11 @@ task.spawn(function()
 end)
 
 sections.MiscQolSection:Header({ Text = "Quality of Life" })
+sections.MiscQolSection:Toggle({
+    Name = "Auto Tutorial (fresh alts, experimental)",
+    Default = false,
+    Callback = function(s) autoTutorialEnabled = s end
+}, "AutoTutorialToggle")
 sections.MiscQolSection:Toggle({
     Name = "Remove Roll UI",
     Default = false,
@@ -2486,6 +2719,57 @@ end
 table.insert(hubConnections, LocalPlayer.CharacterAdded:Connect(function(character) setupWalkSpeedWatcher(character) end))
 if LocalPlayer.Character then setupWalkSpeedWatcher(LocalPlayer.Character) end
 
+-- stay centered in our own garden when nothing else is running: a quiet, legit-looking resting spot.
+-- Gated on an idle ActivityPriority so it never fights a real action, and only fires when we've
+-- actually drifted off-center. Flies (never teleports) so the anti-cheat sees normal motion.
+task.spawn(function()
+    while not stopped do
+        task.wait(3)
+        if stayCentered and not ActivityPriority.currentActivity then
+            local c, hrp = myPlotCenter(), hrpNow()
+            if c and hrp and (hrp.Position - c).Magnitude > (centerDist or 30) then
+                if ActivityPriority:SetActivity("Recenter") then
+                    pcall(function() flyTo(c) end)
+                    ActivityPriority:ClearActivity("Recenter")
+                end
+            end
+        end
+    end
+end)
+
+-- // ---- session guard / recovery ---- //
+-- Every loop is `while not stopped` and helpers (hrpNow/myPlot/pdata) re-fetch each call, so they
+-- self-heal on respawn. The two things that DON'T: the cached replica (_replica) goes stale after a
+-- teleport to a new server, and the game re-adds its idle-kick on the new server. Re-warm both.
+local function suppressIdleKick()
+    pcall(function()
+        local GC = getconnections or get_signal_cons
+        if GC then for _, v in pairs(GC(LocalPlayer.Idled)) do
+            if v.Disable then v:Disable() elseif v.Disconnect then v:Disconnect() end
+        end end
+    end)
+end
+do
+    local function recover(reason)
+        task.spawn(function()
+            task.wait(2)  -- let the new character/replica stream in
+            rewarmReplica(); suppressIdleKick()
+            pcall(function() Window:Notify({ Title = "Apel Hub", Description = "session recovered (" .. reason .. ")", Lifetime = 4 }) end)
+        end)
+    end
+    pcall(function()
+        local TPS = game:GetService("TeleportService")
+        table.insert(hubConnections, TPS.LocalPlayerArrivedFromTeleport:Connect(function() recover("teleport") end))
+    end)
+    -- replica-desync watchdog: re-warm if the replica goes empty while we're in-world (any cause, no respawn spam)
+    task.spawn(function()
+        while not stopped do
+            task.wait(20)
+            if hrpNow() and not next(pdata()) then rewarmReplica() end
+        end
+    end)
+end
+
 -- // ========================================== \\ --
 -- //          ACTIVITY LOOPS (PRIORITY)         \\ --
 -- // ========================================== \\ --
@@ -2495,15 +2779,19 @@ task.spawn(function()
     while not stopped do
         if autoStealEnabled and ActivityPriority:CanStart("AutoSteal") then
             ActivityPriority:SetActivity("AutoSteal")
+            fpsBurstBegin()
             if isNight() then
                 local targets = stealable()
                 if stealMostExpensive then
-                    table.sort(targets, function(a, b) return stealValue(a.model) > stealValue(b.model) end)
+                    -- cache + sanitize scores: a NaN from stealValue would make the comparator violate
+                    -- strict-weak-ordering and table.sort would THROW, killing this thread + wedging priority.
+                    for _, f in ipairs(targets) do local v = tonumber(stealValue(f.model)) or 0; if v ~= v then v = 0 end; f._v = v end
+                    table.sort(targets, function(a, b) return a._v > b._v end)
                 end
                 for _, f in ipairs(targets) do
                     if not (autoStealEnabled and isNight()) then break end
                     -- teleport to the fruit and settle (so the server accepts the steal from range)
-                    if f.pos then local hrp = hrpNow(); if hrp then pcall(function() hrp.CFrame = CFrame.new(f.pos + Vector3.new(0, 4, 0)) end); task.wait(0.35) end end
+                    if f.pos then flyTo(f.pos); task.wait(0.35) end
                     pcall(function() BeginSteal:Fire(f.owner, f.plantId, f.fruitId) end)
                     task.wait(0.15)  -- let the server register the begin before completing
                     pcall(function() CompleteSteal:Fire() end)
@@ -2516,7 +2804,7 @@ task.spawn(function()
                     if stealReturnHome and LocalPlayer:GetAttribute("CarryingStolenFruit") then
                         local base, hrp = myBasePos(), hrpNow()
                         if base and hrp then
-                            pcall(function() hrp.CFrame = CFrame.new(base + Vector3.new(0, 4, 0)) end)
+                            flyTo(base)
                             local t1 = os.clock()
                             while LocalPlayer:GetAttribute("CarryingStolenFruit") and os.clock() - t1 < 3 and autoStealEnabled do task.wait(0.15) end
                         end
@@ -2524,6 +2812,7 @@ task.spawn(function()
                     if stealDelay > 0 then task.wait(stealDelay) end
                 end
             end
+            fpsBurstEnd()
             ActivityPriority:ClearActivity("AutoSteal")
         end
         waitInterval(function() return autoStealEnabled end, 1.5)
@@ -2602,7 +2891,7 @@ end)
 task.spawn(function()
     while not stopped do
         local seedList = (seedBuyMode == "All") and seedNames() or selectedSeeds
-        if autoBuySeedEnabled and #seedList > 0 and ActivityPriority:CanStart("AutoBuySeed") then
+        if autoBuySeedEnabled and not smartFarmEnabled and #seedList > 0 and ActivityPriority:CanStart("AutoBuySeed") then
             ActivityPriority:SetActivity("AutoBuySeed")
             for _, name in ipairs(seedList) do
                 if not autoBuySeedEnabled then break end
@@ -2686,7 +2975,7 @@ task.spawn(function()
                 if ActivityPriority.currentActivity ~= "AutoCollect" then break end
                 local hrp = hrpNow()
                 if hrp and it.inst and it.inst.Parent then
-                    pcall(function() hrp.CFrame = CFrame.new(it.pos + Vector3.new(0, 3, 0)) end)
+                    flyTo(it.pos)
                     task.wait(0.1)
                     if it.prompt and fireProx then pcall(function() fireProx(it.prompt) end) end  -- pickup now needs the prompt fired
                     task.wait(0.05)
@@ -3033,68 +3322,183 @@ task.spawn(function()
     end
 end)
 
--- AutoPlant (40) - multi-select; each seed fills free raycast-grid spots until depleted
-task.spawn(function()
-    while not stopped do
-        if autoPlantEnabled and #selectedPlantSeeds > 0 and ActivityPriority:CanStart("AutoPlant") then
-            ActivityPriority:SetActivity("AutoPlant")
-            local spacing = tightPackEnabled and 1 or plantSpacing  -- tight pack = densest grid (server-rejects are skipped)
-            local grid = plantGrid(spacing)
-            if #grid > 0 then
-                local plot = myPlot()
-                local plantsFolder = plot and plot:FindFirstChild("Plants")
-                local occupied = existingPlantPositions()
-                local function isClear(pos)
-                    for _, op in ipairs(occupied) do
-                        if (Vector2.new(pos.X, pos.Z) - Vector2.new(op.X, op.Z)).Magnitude < 1 then return false end
-                    end
-                    return true
-                end
-                local free = {}
-                for _, p in ipairs(grid) do if isClear(p) then free[#free + 1] = p end end
-                table.clear(plantSeedCount)
-                local fi, planted, attempts = 1, 0, 0
-                -- bound attempts per pass so a dense (tight-pack) grid can't make one pass run forever;
-                -- leftover cells are filled on the next pass. Default 120, or the user's per-pass cap.
-                local attemptCap = (maxAutoPlant > 0 and maxAutoPlant) or 120
-                for _, name in ipairs(selectedPlantSeeds) do
-                    if not autoPlantEnabled or fi > #free or attempts >= attemptCap then break end
+-- plant a list of seed names across free grid cells (verified placement; rejected cells skipped).
+-- Shared by AutoPlant (user-selected) and Smart-Farm (owned, ROI-sorted). Returns planted count.
+function plantSeedsList(seedList)
+    if not seedList or #seedList == 0 then return 0 end
+    local spacing = tightPackEnabled and 1 or plantSpacing  -- tight pack = densest grid (server-rejects are skipped)
+    local grid = plantGrid(spacing)
+    if #grid == 0 then return 0 end
+    local plot = myPlot()
+    local plantsFolder = plot and plot:FindFirstChild("Plants")
+    local occupied = existingPlantPositions()
+    local function isClear(pos)
+        for _, op in ipairs(occupied) do
+            if (Vector2.new(pos.X, pos.Z) - Vector2.new(op.X, op.Z)).Magnitude < 1 then return false end
+        end
+        return true
+    end
+    local free = {}
+    for _, p in ipairs(grid) do if isClear(p) then free[#free + 1] = p end end
+    local plantSeedCount = {}  -- LOCAL (reentrancy-safe): AutoPlant/SmartFarm/tutorial can overlap; a shared tally would corrupt caps
+    local fi, planted, attempts = 1, 0, 0
+    local attemptCap = (maxAutoPlant > 0 and maxAutoPlant) or 120  -- bound per-pass; rest fills next pass
+    for _, name in ipairs(seedList) do
+        if fi > #free or attempts >= attemptCap then break end
+        if maxAutoPlant > 0 and planted >= maxAutoPlant then break end
+        if not inSet(plantBlacklist, name) then
+            local plantLim = tonumber(plantSeedLimits[name])
+            local seedCap = (plantLim and plantLim > 0) and plantLim or nil  -- nil/0 = unlimited
+            local held = equipSeedTool(name) or seedToolFor(name)  -- equipped tool, or unequipped backpack tool
+            if held then
+                local seedArg = held:GetAttribute("SeedTool") or name  -- client parity: fire the tool's real SeedTool value
+                while fi <= #free and attempts < attemptCap do
                     if maxAutoPlant > 0 and planted >= maxAutoPlant then break end
-                    if not inSet(plantBlacklist, name) then
-                        local plantLim = tonumber(plantSeedLimits[name])
-                        local seedCap = (plantLim and plantLim > 0) and plantLim or nil  -- nil/0 = unlimited
-                        local held = equipSeedTool(name) or seedToolFor(name)  -- equipped tool, or unequipped backpack tool (server accepts it)
-                        if held then
-                            -- mirror the real client: pass the tool's actual SeedTool attribute value as the seed name
-                            local seedArg = held:GetAttribute("SeedTool") or name
-                            while fi <= #free and attempts < attemptCap do
-                                if not autoPlantEnabled then break end
-                                if maxAutoPlant > 0 and planted >= maxAutoPlant then break end
-                                if seedCap and (plantSeedCount[name] or 0) >= seedCap then break end
-                                held = heldToolByAttr("SeedTool") or seedToolFor(name)
-                                if not held then break end
-                                seedArg = held:GetAttribute("SeedTool") or name
-                                local pos = free[fi]; fi = fi + 1; attempts = attempts + 1
-                                local before = plantsFolder and #plantsFolder:GetChildren() or nil
-                                pcall(function() PlantSeed:Fire(pos, seedArg, held) end)
-                                task.wait(0.16)
-                                -- VERIFY it actually landed: the server silently rejects some placements (e.g.
-                                -- tall single-harvest plants like Bamboo/Mushroom placed too close). Harvest is
-                                -- lower priority so it can't remove plants mid-pass -> a count increase is reliable.
-                                -- A rejected cell is skipped (move to the next) instead of being counted as planted.
-                                local landed = (before == nil) or (#plantsFolder:GetChildren() > before)
-                                if landed then
-                                    plantSeedCount[name] = (plantSeedCount[name] or 0) + 1
-                                    planted = planted + 1
-                                end
-                            end
-                        end
+                    if seedCap and (plantSeedCount[name] or 0) >= seedCap then break end
+                    held = heldToolByAttr("SeedTool") or seedToolFor(name)
+                    if not held then break end
+                    seedArg = held:GetAttribute("SeedTool") or name
+                    local pos = free[fi]; fi = fi + 1; attempts = attempts + 1
+                    local before = plantsFolder and #plantsFolder:GetChildren() or nil
+                    pcall(function() PlantSeed:Fire(pos, seedArg, held) end)
+                    task.wait(0.16)
+                    local landed = (before == nil) or (#plantsFolder:GetChildren() > before)  -- skip server-rejected cells
+                    if landed then
+                        plantSeedCount[name] = (plantSeedCount[name] or 0) + 1
+                        planted = planted + 1
                     end
                 end
             end
+        end
+    end
+    return planted
+end
+
+-- AutoPlant (40) - multi-select; fills free cells with the selected seeds (paused while Smart-Farm runs)
+task.spawn(function()
+    while not stopped do
+        if autoPlantEnabled and not smartFarmEnabled and #selectedPlantSeeds > 0 and ActivityPriority:CanStart("AutoPlant") then
+            ActivityPriority:SetActivity("AutoPlant")
+            plantSeedsList(selectedPlantSeeds)
             ActivityPriority:ClearActivity("AutoPlant")
         end
         waitInterval(function() return autoPlantEnabled end, plantInterval)
+    end
+end)
+
+-- // ---- SMART AUTO-FARM (ROI economy brain) ---- //
+-- ROI = estimated fruit value / seed cost. fruitValueCalc(seedName,1,nil,LocalPlayer,0) approximates
+-- value (assumes harvested fruit name == seed name); unknown -> 0 (ranked last). Guarded like stealValue.
+function seedROIScore(name)
+    local cost = seedPrice(name); if not cost or cost <= 0 then cost = 1 end
+    local calc = fruitValueCalc(); local val = 0
+    if calc then local ok, v = pcall(calc, name, 1, nil, LocalPlayer, 0); if ok and type(v) == "number" then val = v end end
+    return val / cost
+end
+function bestInStockSeeds()
+    local out = {}
+    local ok, items = pcall(function() return ReplicatedStorage.StockValues.SeedShop.Items end)
+    if not (ok and items) then return out end
+    for _, sv in ipairs(items:GetChildren()) do
+        if sv:IsA("ValueBase") and tonumber(sv.Value) and sv.Value > 0 and not inSet(plantBlacklist, sv.Name) then
+            out[#out + 1] = { name = sv.Name, score = seedROIScore(sv.Name) }
+        end
+    end
+    table.sort(out, function(a, b) return a.score > b.score end)
+    return out
+end
+function ownedPlantableSeeds()
+    local list = {}
+    for name, c in pairs(invNames("Seeds")) do
+        if (c or 0) > 0 and not inSet(plantBlacklist, name) then list[#list + 1] = name end
+    end
+    table.sort(list, function(a, b) return seedROIScore(a) > seedROIScore(b) end)
+    return list
+end
+function smartBuyBest()
+    local bought = 0
+    for _, e in ipairs(bestInStockSeeds()) do
+        if bought >= smartBuyPerCycle then break end
+        if e.score >= (smartMinROI or 0) then
+            local price = seedPrice(e.name)
+            while bought < smartBuyPerCycle do
+                if not smartFarmEnabled then break end
+                if price > 0 and (getSheckles() - (smartBudgetReserve or 0)) < price then break end
+                local stock = stockOf("SeedShop", e.name)
+                if stock ~= nil and stock <= 0 then break end
+                if not pcall(function() PurchaseSeed:Fire(e.name) end) then break end
+                bought = bought + 1; task.wait(0.12)
+            end
+        end
+    end
+    return bought
+end
+SMART_JUNK_DEFAULT = { Carrot = true, Strawberry = true, Blueberry = true, Tomato = true, Apple = true,
+    Corn = true, Tulip = true, Cactus = true, Pineapple = true, ["Green Bean"] = true, Banana = true,
+    Grape = true, Coconut = true, Mango = true, ["Baby Cactus"] = true }
+function smartCleanup()
+    local f = myPlantsFolder(); if not f then return 0 end
+    local junk = (next(smartCleanupSeeds) ~= nil) and smartCleanupSeeds or nil
+    local sh = shovelTool(); if not sh then return 0 end
+    local hum = humanoid(); if hum then pcall(function() hum:EquipTool(sh) end); task.wait(0.25) end
+    sh = shovelTool(); local shovelName = sh and sh:GetAttribute("Shovel")
+    if not (sh and shovelName and UseShovel) then return 0 end
+    local n = 0
+    for _, m in ipairs(f:GetChildren()) do
+        if stopped or not smartFarmEnabled then break end
+        local sn = m:GetAttribute("SeedName")
+        local isJunk = sn and ((junk and junk[sn]) or (not junk and SMART_JUNK_DEFAULT[sn]))
+        local blocked = sn and #wipeBlacklist > 0 and inSet(wipeBlacklist, sn)
+        if isJunk and not blocked then
+            pcall(function() UseShovel:Fire(m.Name, "", shovelName, sh) end)
+            n = n + 1; task.wait(0.55 + math.random() * 0.3)
+        end
+    end
+    return n
+end
+
+-- SmartFarm (85) - one toggle: buy best-ROI seeds -> plant everything owned -> cleanup junk
+task.spawn(function()
+    while not stopped do
+        if smartFarmEnabled and ActivityPriority:CanStart("SmartFarm") then
+            ActivityPriority:SetActivity("SmartFarm")
+            pcall(smartBuyBest)
+            pcall(function() plantSeedsList(ownedPlantableSeeds()) end)
+            if smartCleanupEnabled then pcall(smartCleanup) end
+            ActivityPriority:ClearActivity("SmartFarm")
+        end
+        waitInterval(function() return smartFarmEnabled end, smartFarmInterval)
+    end
+end)
+
+-- // ---- AUTO TUTORIAL (fresh accounts; experimental) ---- //
+-- Decompile: Networking.Tutorial.{Ready,Complete} exist but Complete is never observed being fired
+-- (the runner body failed to decompile), so this is BEST-EFFORT. Only acts while the account looks
+-- fresh (no money + nothing planted, or workspace InTutorial set) so it never disturbs real accounts.
+function tutorialActive()
+    if workspace:GetAttribute("InTutorial") then return true end
+    local plot = myPlot(); local plants = plot and plot:FindFirstChild("Plants")
+    local n = plants and #plants:GetChildren() or 0
+    return getSheckles() < 100 and n == 0
+end
+function runAutoTutorialPass()
+    for _ = 1, 5 do if TutorialReady then pcall(function() TutorialReady:Fire() end) end task.wait(0.4) end  -- handshake
+    local cheap = (seedNames() or {})[1] or "Carrot"  -- cheapest seed (list is price-ascending)
+    for _ = 1, 8 do
+        if not autoTutorialEnabled then return end
+        if getSheckles() >= seedPrice(cheap) then pcall(function() PurchaseSeed:Fire(cheap) end); task.wait(0.3) end
+        plantSeedsList({ cheap }); task.wait(0.3)
+        for _, h in ipairs(ripeHarvests()) do pcall(function() CollectFruit:Fire(h.plantId, h.fruitId) end); task.wait(0.1) end
+        sellAllNow()
+        if TutorialComplete then pcall(function() TutorialComplete:Fire() end) end
+        if not tutorialActive() then break end
+        task.wait(2)
+    end
+end
+task.spawn(function()
+    while not stopped do
+        if autoTutorialEnabled and tutorialActive() then pcall(runAutoTutorialPass) end
+        waitInterval(function() return autoTutorialEnabled end, 6)
     end
 end)
 
@@ -3103,6 +3507,7 @@ task.spawn(function()
     while not stopped do
         if autoHarvestEnabled and ActivityPriority:CanStart("AutoHarvest") then
             ActivityPriority:SetActivity("AutoHarvest")
+            fpsBurstBegin()
             local list = ripeHarvests()
             if #list == 0 then
                 if autoSellEnabled and fruitCount() > 0 then sellAllNow() end
@@ -3119,6 +3524,7 @@ task.spawn(function()
                 end
                 if autoSellEnabled then sellAllNow() end
             end
+            fpsBurstEnd()
             ActivityPriority:ClearActivity("AutoHarvest")
         end
         waitInterval(function() return autoHarvestEnabled end, harvestInterval)
@@ -3210,8 +3616,7 @@ task.spawn(function()
                         end
                     end
                 end
-                local hrp = hrpNow()
-                if hrp and savedCF then pcall(function() hrp.CFrame = savedCF end) end
+                if savedCF then flyTo(savedCF.Position) end
                 ActivityPriority:ClearActivity("FieldGuard")
             end
         end
@@ -3514,9 +3919,14 @@ end)
 --   },
 --   Harvest = { IgnoreMutations={}, IgnoreTypes={}, MinWeight=0 },
 --   Steal = { Auto=false, MostExpensive=true }, Guard=false,
---   Fps = { Boost=true, Max=false, Cap=0 }, Wipe = { Seeds={} },
+--   Fps = { Boost=true, Max=false, Cap=0, No3d=false, Mute=false, Burst=false, BurstCap=120, IdleCap=0 }, Wipe = { Seeds={} },
 --   Webhook = { URL="", Report=false, ReportInterval=5, TameNotify=true, TameRarities={"Mythic"},
 --     TamePetNames={"Unicorn"}, MutationNotify=true, SeedNames={"Rainbow"}, Note="", DiscordId="" },
+--   -- newly exposed: AutoFarm.{Smart,SmartMinROI,SmartReserve,SmartBuyPerCycle,SmartCleanup,SmartCleanupSeeds,
+--   --   Skill,Skills,BuyCrates,Crates,PlantSpacing,PlantInterval,SellInterval,HarvestInterval,BuySeedInterval},
+--   -- Sell.{FavMutation,FavInventory,FavFarm}; Steal.{ReturnHome,Delay}; Pets.{AutoSell,SellNames};
+--   -- Map.{CollectSeeds,CollectAcorns}; Misc.{StatusOverlay,RemoveRollUi,AutoTutorial,WalkSpeed,FlySpeed};
+--   -- Fps.{No3d,Mute,Burst,BurstCap,IdleCap}; Hop = { Auto, Seeds={}, MinPrice, Interval }.
 -- }
 function applyGConfig(C, silent)
     C = C or (_G and _G.ApelHubConfig) or (getgenv and getgenv().ApelHubConfig)
@@ -3529,6 +3939,23 @@ function applyGConfig(C, silent)
         if f.Sell ~= nil then autoSellEnabled = b(f.Sell) end
         if f.Plant ~= nil then autoPlantEnabled = b(f.Plant) end
         if f.TightPack ~= nil then tightPackEnabled = b(f.TightPack) end
+        if f.Smart ~= nil then smartFarmEnabled = b(f.Smart) end
+        if f.SmartMinROI ~= nil then smartMinROI = tonumber(f.SmartMinROI) or 0 end
+        if f.SmartReserve ~= nil then smartBudgetReserve = tonumber(f.SmartReserve) or 0 end
+        if f.SmartBuyPerCycle ~= nil then smartBuyPerCycle = tonumber(f.SmartBuyPerCycle) or smartBuyPerCycle end
+        if f.SmartCleanup ~= nil then smartCleanupEnabled = b(f.SmartCleanup) end
+        if f.SmartCleanupSeeds ~= nil then smartCleanupSeeds = {}; for _, n in ipairs(arr(f.SmartCleanupSeeds)) do smartCleanupSeeds[n] = true end end
+        if f.Skill ~= nil then autoSkillEnabled = b(f.Skill) end
+        if f.Skills ~= nil then selectedSkills = arr(f.Skills) end
+        if f.BuyCrates ~= nil then autoBuyCrateEnabled = b(f.BuyCrates) end
+        if f.Crates ~= nil then selectedCrates = arr(f.Crates); if #selectedCrates > 0 then autoBuyCrateEnabled = true end end
+        if f.CollectSeeds ~= nil then autoCollectSeedsEnabled = b(f.CollectSeeds) end
+        if f.CollectAcorns ~= nil then autoCollectAcornsEnabled = b(f.CollectAcorns) end
+        if f.PlantSpacing ~= nil then plantSpacing = tonumber(f.PlantSpacing) or plantSpacing end
+        if f.PlantInterval ~= nil then plantInterval = tonumber(f.PlantInterval) or plantInterval end
+        if f.SellInterval ~= nil then sellInterval = tonumber(f.SellInterval) or sellInterval end
+        if f.HarvestInterval ~= nil then harvestInterval = tonumber(f.HarvestInterval) or harvestInterval end
+        if f.BuySeedInterval ~= nil then buySeedInterval = tonumber(f.BuySeedInterval) or buySeedInterval end
         if f.Expand ~= nil then autoExpandEnabled = b(f.Expand) end
         if f.Daily ~= nil then autoDailyEnabled = b(f.Daily) end
         if f.PlantSeeds ~= nil then selectedPlantSeeds = arr(f.PlantSeeds) end
@@ -3579,6 +4006,9 @@ function applyGConfig(C, silent)
         if s.KeepMinWeight then favMinWeight = tonumber(s.KeepMinWeight) or 0 end
         if s.KeepMinPrice then favMinPrice = tonumber(s.KeepMinPrice) or 0 end
         if s.FavoriteByFruit ~= nil and type(s.FavoriteByFruit) == "table" then selectedFavByFruit = s.FavoriteByFruit end
+        if s.FavMutation ~= nil then autoFavMutationEnabled = b(s.FavMutation) end
+        if s.FavInventory ~= nil then autoFavInventoryEnabled = b(s.FavInventory) end
+        if s.FavFarm ~= nil then autoFavFarmEnabled = b(s.FavFarm) end
     end
     if type(C.Harvest) == "table" then
         local h = C.Harvest
@@ -3589,18 +4019,27 @@ function applyGConfig(C, silent)
     if type(C.Steal) == "table" then
         if C.Steal.Auto ~= nil then autoStealEnabled = b(C.Steal.Auto) end
         if C.Steal.MostExpensive ~= nil then stealMostExpensive = b(C.Steal.MostExpensive) end
+        if C.Steal.ReturnHome ~= nil then stealReturnHome = b(C.Steal.ReturnHome) end
+        if C.Steal.Delay ~= nil then stealDelay = tonumber(C.Steal.Delay) or stealDelay end
     end
     if C.Guard ~= nil then fieldGuardEnabled = b(C.Guard) end
     if type(C.Fps) == "table" then
         if C.Fps.Max then fpsMaxEnabled = true; fpsBoostEnabled = true end
         if C.Fps.Boost then fpsBoostEnabled = true end
         if C.Fps.Cap then fpsCap = tonumber(C.Fps.Cap) or 0 end
+        if C.Fps.Burst ~= nil then fpsBurstEnabled = b(C.Fps.Burst) end
+        if C.Fps.BurstCap ~= nil then fpsBurstCap = tonumber(C.Fps.BurstCap) or fpsBurstCap end
+        if C.Fps.IdleCap ~= nil then fpsIdleCap = tonumber(C.Fps.IdleCap) or 0 end
         if fpsBoostEnabled then pcall(applyFpsBoost) end
         if fpsCap and fpsCap > 0 then pcall(applyFpsCap) end
+        if C.Fps.No3d then pcall(function() set3dRender(false) end) end
+        if C.Fps.Mute then pcall(function() muteAudio(true) end) end
     end
     if type(C.Pets) == "table" then
         local p = C.Pets
         if p.AutoBuy ~= nil then autoBuyPetsEnabled = b(p.AutoBuy) end
+        if p.AutoSell ~= nil then autoSellPetsEnabled = b(p.AutoSell) end
+        if p.SellNames ~= nil then selectedSellPets = arr(p.SellNames) end
         if p.MaxPrice ~= nil then maxPetPrice = tonumber(p.MaxPrice) or maxPetPrice end
         if p.TameNames ~= nil then selectedTamePetNames = arr(p.TameNames) end
         if p.TameRarities ~= nil then selectedTamePetRarities = arr(p.TameRarities) end
@@ -3650,6 +4089,8 @@ function applyGConfig(C, silent)
         local mp = C.Map
         if mp.CollectSeedPacks ~= nil then autoSeedEventEnabled = b(mp.CollectSeedPacks) end
         if mp.SeedPackTypes ~= nil then selectedEventSeedTypes = arr(mp.SeedPackTypes) end
+        if mp.CollectSeeds ~= nil then autoCollectSeedsEnabled = b(mp.CollectSeeds) end
+        if mp.CollectAcorns ~= nil then autoCollectAcornsEnabled = b(mp.CollectAcorns) end
     end
     if type(C.Webhook) == "table" then
         local w = C.Webhook
@@ -3667,10 +4108,21 @@ function applyGConfig(C, silent)
     if type(C.Misc) == "table" then
         if C.Misc.StatusOverlay ~= nil then pcall(setStatusOverlay, b(C.Misc.StatusOverlay)) end  -- black info panel
         if C.Misc.RemoveRollUi ~= nil then removeRollUiEnabled = b(C.Misc.RemoveRollUi) end
+        if C.Misc.AutoTutorial ~= nil then autoTutorialEnabled = b(C.Misc.AutoTutorial) end
+        if C.Misc.WalkSpeed ~= nil then currentSpeed = tonumber(C.Misc.WalkSpeed) or currentSpeed; local h = humanoid(); if h then pcall(function() h.WalkSpeed = currentSpeed end) end end
+        if C.Misc.FlySpeed ~= nil then flyMoveSpeed = tonumber(C.Misc.FlySpeed) or flyMoveSpeed end
+        if C.Misc.StayCentered ~= nil then stayCentered = b(C.Misc.StayCentered) end
+        if C.Misc.CenterDist ~= nil then centerDist = tonumber(C.Misc.CenterDist) or centerDist end
     end
     if type(C.Wipe) == "table" then
         if C.Wipe.Seeds then selectedWipeSeeds = arr(C.Wipe.Seeds) end
         if C.Wipe.Blacklist then wipeBlacklist = arr(C.Wipe.Blacklist) end
+    end
+    if type(C.Hop) == "table" then
+        if C.Hop.Auto ~= nil then autoHopRareEnabled = b(C.Hop.Auto) end
+        if C.Hop.Seeds ~= nil then selectedHopSeeds = arr(C.Hop.Seeds) end
+        if C.Hop.MinPrice ~= nil then hopRareMinPrice = tonumber(C.Hop.MinPrice) or hopRareMinPrice end
+        if C.Hop.Interval ~= nil then hopInterval = tonumber(C.Hop.Interval) or hopInterval end
     end
     if not silent then pcall(function() Window:Notify({ Title = "Apel Hub", Description = "_G.ApelHubConfig applied.", Lifetime = 4 }) end) end
 end
@@ -3683,7 +4135,7 @@ function applyUserConfig()
     if type(U) ~= "table" then return end
     local function arr(v) return (type(v) == "table") and v or {} end
     local function keysOf(t) local o = {} for k in pairs(arr(t)) do o[#o + 1] = k end return o end
-    local C = { AutoFarm = {}, Pets = {}, Mail = {}, Sell = {}, Map = {}, Webhook = {}, Fps = {}, Wipe = {}, Misc = {} }
+    local C = { AutoFarm = {}, Pets = {}, Mail = {}, Sell = {}, Map = {}, Webhook = {}, Fps = {}, Wipe = {}, Misc = {}, Steal = {}, Harvest = {}, Open = {}, Hop = {} }
     local f = C.AutoFarm
 
     if U["FPS Cap"] ~= nil then C.Fps.Cap = tonumber(U["FPS Cap"]) end
@@ -3706,6 +4158,11 @@ function applyUserConfig()
     if U["Limit Auto Plant"] ~= nil then f.LimitAutoPlant = tonumber(U["Limit Auto Plant"]) end
     if U["Blacklist Seed"] ~= nil then f.BlacklistSeeds = arr(U["Blacklist Seed"]) end
     if U["Tight Pack"] ~= nil then f.TightPack = U["Tight Pack"] end
+    if U["Smart Auto Farm"] ~= nil then f.Smart = U["Smart Auto Farm"] end
+    if U["Smart Min ROI"] ~= nil then f.SmartMinROI = tonumber(U["Smart Min ROI"]) end
+    if U["Smart Reserve"] ~= nil then f.SmartReserve = tonumber(U["Smart Reserve"]) end
+    if U["Smart Cleanup"] ~= nil then f.SmartCleanup = U["Smart Cleanup"] end
+    if U["Smart Cleanup Seeds"] ~= nil then f.SmartCleanupSeeds = arr(U["Smart Cleanup Seeds"]) end
     if U["Max Density"] ~= nil then f.TightPack = U["Max Density"] end
 
     -- harvest (сбор) + sell (продажа) - accept a few common key spellings
@@ -3753,6 +4210,7 @@ function applyUserConfig()
 
     -- black status panel (dark info screen) + roll UI
     if U["Status Overlay"] ~= nil then C.Misc.StatusOverlay = U["Status Overlay"] end
+    if U["Auto Tutorial"] ~= nil then C.Misc.AutoTutorial = U["Auto Tutorial"] end
     if U["Black Panel"] ~= nil then C.Misc.StatusOverlay = U["Black Panel"] end
     if U["Dark Screen"] ~= nil then C.Misc.StatusOverlay = U["Dark Screen"] end
     if U["Remove Roll UI"] ~= nil then C.Misc.RemoveRollUi = U["Remove Roll UI"] end
@@ -3762,6 +4220,46 @@ function applyUserConfig()
     if U["Boost FPS"] ~= nil then C.Fps.Boost = U["Boost FPS"] end
     if U["FPS Max"] ~= nil then C.Fps.Max = U["FPS Max"] end
     if U["Max FPS Boost"] ~= nil then C.Fps.Max = U["Max FPS Boost"] end
+    if U["Disable 3D Render"] ~= nil then C.Fps.No3d = U["Disable 3D Render"] end
+    if U["Mute Audio"] ~= nil then C.Fps.Mute = U["Mute Audio"] end
+    if U["FPS Burst"] ~= nil then C.Fps.Burst = U["FPS Burst"] end
+    if U["Burst FPS Cap"] ~= nil then C.Fps.BurstCap = tonumber(U["Burst FPS Cap"]) end
+    if U["Idle FPS Cap"] ~= nil then C.Fps.IdleCap = tonumber(U["Idle FPS Cap"]) end
+
+    -- newly-exposed feature groups (flat keys -> nested C, ride through applyGConfig)
+    if U["Auto Skill"] ~= nil then f.Skill = U["Auto Skill"] end
+    if U["Skills"] ~= nil then f.Skills = arr(U["Skills"]) end
+    if U["Auto Buy Crates"] ~= nil then f.BuyCrates = U["Auto Buy Crates"] end
+    if U["Buy Crates"] ~= nil then f.Crates = arr(U["Buy Crates"]) end
+    if U["Plant Spacing"] ~= nil then f.PlantSpacing = tonumber(U["Plant Spacing"]) end
+    if U["Sell Interval"] ~= nil then f.SellInterval = tonumber(U["Sell Interval"]) end
+    if U["Harvest Interval"] ~= nil then f.HarvestInterval = tonumber(U["Harvest Interval"]) end
+    if U["Auto Daily"] ~= nil then f.Daily = U["Auto Daily"] end
+    if U["Auto Sprinkler"] ~= nil then f.Sprinkler = U["Auto Sprinkler"] end
+    if U["Auto Water"] ~= nil then f.Water = U["Auto Water"] end
+    if U["Auto Sell Pets"] ~= nil then C.Pets.AutoSell = U["Auto Sell Pets"] end
+    if U["Sell Pets"] ~= nil then C.Pets.SellNames = arr(U["Sell Pets"]) end
+    if U["Auto Buy Pets"] ~= nil then C.Pets.AutoBuy = U["Auto Buy Pets"] end
+    if U["Equip Pets Toggle"] ~= nil then C.Pets.Equip = U["Equip Pets Toggle"] end
+    if U["Auto Collect Seeds"] ~= nil then C.Map.CollectSeeds = U["Auto Collect Seeds"] end
+    if U["Auto Collect Acorns"] ~= nil then C.Map.CollectAcorns = U["Auto Collect Acorns"] end
+    if U["Seed Pack Types"] ~= nil then C.Map.SeedPackTypes = arr(U["Seed Pack Types"]) end
+    if U["Auto Steal"] ~= nil then C.Steal.Auto = U["Auto Steal"] end
+    if U["Steal Most Expensive"] ~= nil then C.Steal.MostExpensive = U["Steal Most Expensive"] end
+    if U["Steal Return Home"] ~= nil then C.Steal.ReturnHome = U["Steal Return Home"] end
+    if U["Field Guard"] ~= nil then C.Guard = U["Field Guard"] end
+    if U["Auto Open Eggs"] ~= nil then C.Open.Eggs = U["Auto Open Eggs"] end
+    if U["Auto Open Crates"] ~= nil then C.Open.Crates = U["Auto Open Crates"] end
+    if U["Auto Open Packs"] ~= nil then C.Open.Packs = U["Auto Open Packs"] end
+    if U["Auto Hop"] ~= nil then C.Hop.Auto = U["Auto Hop"] end
+    if U["Hop Seeds"] ~= nil then C.Hop.Seeds = arr(U["Hop Seeds"]) end
+    if U["Hop Min Price"] ~= nil then C.Hop.MinPrice = tonumber(U["Hop Min Price"]) end
+    if U["Walk Speed"] ~= nil then C.Misc.WalkSpeed = tonumber(U["Walk Speed"]) end
+    if U["Fly Speed"] ~= nil then C.Misc.FlySpeed = tonumber(U["Fly Speed"]) end
+    if U["Stay Centered"] ~= nil then C.Misc.StayCentered = U["Stay Centered"] end
+    if U["Harvest Ignore Mutations"] ~= nil then C.Harvest.IgnoreMutations = arr(U["Harvest Ignore Mutations"]) end
+    if U["Harvest Ignore Types"] ~= nil then C.Harvest.IgnoreTypes = arr(U["Harvest Ignore Types"]) end
+    if U["Harvest Min Weight"] ~= nil then C.Harvest.MinWeight = tonumber(U["Harvest Min Weight"]) end
 
     applyGConfig(C, true)
     pcall(function() Window:Notify({ Title = "Apel Hub", Description = "UserConfig (compat) applied.", Lifetime = 4 }) end)
@@ -3798,6 +4296,7 @@ if getgenv then
     getgenv()._GAG2_Stop = function()
         stopped = true
         autoPlantEnabled = false; autoHarvestEnabled = false; autoSellEnabled = false
+        smartFarmEnabled = false; smartCleanupEnabled = false; autoTutorialEnabled = false
         autoBuySeedEnabled = false; autoBuyGearEnabled = false; autoBuyCrateEnabled = false
         autoExpandEnabled = false; autoDailyEnabled = false; autoSprinklerEnabled = false
         autoWaterEnabled = false; autoSkillEnabled = false
