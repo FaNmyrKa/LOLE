@@ -1,6 +1,8 @@
 print("hellow")
 getgenv().UserConfig = {
-    ["FPS Cap"] = 0,                                  -- 0 = без капа (у них в примере было 7 = очень низко)
+    ["Stay Centered"]   = true,
+    ["Center Distance"] = 18,
+    ["FPS Cap"] = 7,                                  -- 0 = без капа (у них в примере было 7 = очень низко)
     ["Auto Buy Seed"] = true,
     ["Status Overlay"] = true,   -- чёрная панель (алиасы: "Black Panel", "Dark Screen")
     ["FPS Boost"]      = true,   -- лёгкий буст (off post-fx/тени/low quality)
