@@ -26,7 +26,7 @@ getgenv().UserConfig = {
     },
     ["Equip Pets"] = { {"Deer", 5, 3} },             -- {имя, уровень, слот}
     ["Expand Plot"] = true,
-    ["Plot Expansions"] = true,
+    ["Plot Expansions"] = 3,
     ["Unlock Pet Slots"] = 5,
     ["Auto Collect Seed Packs"] = true,
     ["Gears"] = {
