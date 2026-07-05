@@ -1,0 +1,20 @@
+getgenv().NAH = {
+    DeleteMap = true,
+    BlackScreen = false,
+    LockFragment = 1500,
+    AwakenFruit = false,
+    UpRace = false,
+    LockFps = true,
+    FPSCAP = 10,
+    FarmItems = {
+        Pole = false,
+        Saber = true,
+        GetMirrorFactorWhenHaveCup = true,
+    },
+    TableFruit = {
+        ListFruit = {"Kitsune-Kitsune"},
+        SnipeFruit = true,
+        EatFruit = false
+    },
+}
+loadstring(game:HttpGet("https://api.luarmor.net/files/v3/loaders/9b74c064bf69e11b816ca1b6d188aaed.lua"))()
