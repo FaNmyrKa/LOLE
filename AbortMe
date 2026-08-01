@@ -33,7 +33,7 @@ Config = {
     },
     Webhook = {
         Enabled = true,  -- Enable Discord notifications
-        URL = "webhook here"  -- Replace with actual webhook URL
+        URL = "https://discord.com/api/webhooks/1533223390448582787/zuSjLB79m4UUr7Djqj42qRx-l76akNVy4Aaj0zJoWozNbCDujzu6QgmXPzY1S88tuhsb"  -- Replace with actual webhook URL
     }
 }
 
