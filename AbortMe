@@ -1,14 +1,14 @@
    getgenv().Config = {
       Dashboard = {
-            Enabled = true,       -- Send stats to dashboard
-            SyncConfig = true,    -- Accept config pushes from dashboard
+            Enabled = false,       -- Send stats to dashboard
+            SyncConfig = false,    -- Accept config pushes from dashboard
             GroupName = "fanChyrka",   -- Group name for organising accounts on dashboard (https://zekehub.com/dashboard/adoptme)
         },
-        BabyFarm = false, -- Does baby farm
+        BabyFarm = true, -- Does baby farm
         AutoCertificate = false, -- Auto use Pet Handler Pro Certificate when less than 30 days remaining
         PetFarm = {
-            Enabled = false, -- Enables the Pet Farm
-            FarmEggs = false, -- If true, equips eggs to hatch them. If false, equips regular pets
+            Enabled = true, -- Enables the Pet Farm
+            FarmEggs = true, -- If true, equips eggs to hatch them. If false, equips regular pets
             BuyEggs = false, -- If FarmEggs is true and no eggs in inventory, buy eggs automatically
             EggTypes = {}, -- Which eggs to equip ({} = any egg, or {"cracked_egg", "royal_egg"} for specific)
             BuyEggType = "any", -- Which egg to buy when BuyEggs is true ("any" or specific egg ID)
@@ -20,7 +20,7 @@
         },
         EventFarm = {
             BeeWagon = {
-                Enabled = false, -- Enable the Bee Wagon 2026 event farm (plant, pick, deposit, claim)
+                Enabled = ture, -- Enable the Bee Wagon 2026 event farm (plant, pick, deposit, claim)
                 AutoBuySeeds = true, -- Buy exactly the seeds the vases still need (skips what you already hold)
                 AutoClaimBattlePass = true, -- Claim Bee Pass tiers as soon as the XP unlocks them
                 AutoRestartPass = true, -- Restart the pass after all 13 tiers to keep farming the rewards
