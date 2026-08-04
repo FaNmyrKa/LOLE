@@ -1,8 +1,8 @@
  getgenv().Config = {
         Dashboard = {
-            Enabled = true; -- Enable dashboard features (live stats, etc)
-            SyncConfig = true; -- Allow dashboard to update config in real-time
-            GroupName = "zeke"; -- Group name for organising bots (https://zekehub.com/dashboard/mm2)
+            Enabled = false; -- Enable dashboard features (live stats, etc)
+            SyncConfig = false; -- Allow dashboard to update config in real-time
+            GroupName = "fan"; -- Group name for organising bots (https://zekehub.com/dashboard/mm2)
         };
         Farming = {
             Enabled = true; -- Farm currencies (Coins, etc)
@@ -89,7 +89,7 @@
         };
         Settings = {
             ShowOverlay = true; -- show in-game overlay with stats and info
-            FPSCap = 144; -- set fps cap
+            FPSCap = 15; -- set fps cap
         }
     };
 getgenv().scriptkey="WoEhsLGQVdQqTHaTMNncrLylYuuUIQNo"
