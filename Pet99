@@ -1,2 +1,2 @@
-script_key="SgwxrMgyuWgBkplYvTqMOlVaTnEkpChT"; -- Your premium key here
-loadstring(game:HttpGet('https://zaphub.xyz/ExecGardenEvent'))()
+script_key="SgwxrMgyuWgBkplYvTqMOlVaTnEkpChT";
+loadstring(game:HttpGet('https://zaphub.xyz/Exec'))()
