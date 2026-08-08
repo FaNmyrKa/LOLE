@@ -1,2 +1,50 @@
-script_key="SgwxrMgyuWgBkplYvTqMOlVaTnEkpChT";
-loadstring(game:HttpGet('https://zaphub.xyz/Exec'))()
+_G.ZapHubSettings = {
+    ["NewPetsTracker"] = {Enable = true, WebhookURL = "", PetTypes = {"Gargantuan", "Titanic", "Huge", "Exclusive"}},
+
+    ["Optimization"] = {Enable = true},
+
+    ["TeleportToFiestaLobbyArea"] = {Enable = true},
+    ["FarmFiestaLobbyPinata"] = {Enable = true, CooldownSeconds = 5},
+    ["FiestaPinataChallenge"] = {Enable = false},
+    ["StartFiestaMaze"] = {Enable = true, Difficulty = 0, PartyMode = "Solo", CooldownMinutes = 1},
+    ["CompleteFiestaMaze"] = {Enable = true},
+    ["CollectFiestaPrizeRoom"] = {Enable = true, Eggs = {"LootChest", "HugeChest", "TitanicChest", "LeprechaunChest"}},
+    ["CrafFiestaGifts"] = {Enable = true},
+    ["CombineFiestaKeys"] = {Enable = true, CombineBossKeys = true},
+    ["BuyFiestaUpgrades"] = {Enable = true, Upgrades = {"Damage", "Key Drops", "Pets", "Smash Speed"}},
+    ["UseFiestaBoosters"] = {Enable = true, Boosters = {"Fiesta Maze Damage Booster", "Fiesta Maze XP Booster", "Instant Fiesta Maze XP Booster"}, TierPriority = "Lowest"},
+
+    ["InfinitePetSpeed"] = {Enable = true},
+    ["Tap"] = {Enable = true, Mode = "Random"},
+    ["EfficientFarm"] = {Enable = true},
+    ["CollectOrbs"] = {Enable = true},
+    ["UseUltimate"] = {Enable = true},
+
+    ["MakePetsGold"] = {Enable = false},
+    ["MakePetsRainbow"] = {Enable = false},
+
+    ["ClaimMailbox"] = {Enable = true},
+    ["ClaimFreeGifts"] = {Enable = true},
+    ["ClaimRankRewards"] = {Enable = true},
+    ["ClaimDefaultForeverPackFreeGift"] = {Enable = true},
+
+    ["UseFruits"] = {Enable = false, Fruits = {}},
+    ["UseBuffs"] = {Enable = false, Buffs = {}},
+    ["UsePotions"] = {Enable = false, Potions = {}},
+    ["EquipEnchants"] = {Enable = false, Enchants = {}},
+
+    ["Rejoin"] = {Enable = false, Time = 60}, -- Time is in minutes
+    ["WhiteScreen"] = {Enable = true},
+    ["StatGUI"] = {Enable = true,
+        Items = {
+            {Class = "Currency", Item = "Diamonds"},
+            {Class = "Currency", Item = "FiestaCoins"},
+            {Class = "Currency", Item = "FiestaOrbs"},
+            {Class = "Misc", Item = "Fiesta Candy"},
+            {Class = "Lootbox", Item = "Fiesta Gift"},
+        }
+    },
+}
+
+script_key="SgwxrMgyuWgBkplYvTqMOlVaTnEkpChT"; -- Your premium key here
+loadstring(game:HttpGet('https://zaphub.xyz/ExecPinataMazeEvent'))()
