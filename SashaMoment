@@ -1,2 +1,0 @@
-script_key="SP-QH3H4-V5KKA-6BPF2";
-loadstring(game:HttpGet("https://key.skrilya.ru/loader.lua"))()
