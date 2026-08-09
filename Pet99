@@ -1,7 +1,7 @@
 _G.ZapHubSettings = {
     ["NewPetsTracker"] = {Enable = true, WebhookURL = "", PetTypes = {"Gargantuan", "Titanic", "Huge", "Exclusive"}},
 
-    ["Optimization"] = {Enable = true},
+    ["Optimization"] = {Enable = false},
 
     ["TeleportToFiestaLobbyArea"] = {Enable = true},
     ["FarmFiestaLobbyPinata"] = {Enable = true, CooldownSeconds = 5},
