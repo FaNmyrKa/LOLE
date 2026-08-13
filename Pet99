@@ -34,7 +34,7 @@ _G.ZapHubSettings = {
     ["EquipEnchants"] = {Enable = false, Enchants = {}},
 
     ["Rejoin"] = {Enable = false, Time = 60}, -- Time is in minutes
-    ["WhiteScreen"] = {Enable = true},
+    ["WhiteScreen"] = {Enable = false},
     ["StatGUI"] = {Enable = true,
         Items = {
             {Class = "Currency", Item = "Diamonds"},
