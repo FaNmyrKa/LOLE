@@ -1,0 +1,881 @@
+-- ===================== CLEANUP ON RE-RUN (убить прошлый запуск ДО постройки UI) =====================
+if getgenv()._ApelStop then pcall(getgenv()._ApelStop); task.wait(0.3) end
+getgenv()._running = true
+getgenv()._conns = {}
+
+-- ===================== MACLIB LOADER (auto-fallback: localhost -> github) =====================
+local function loadMacLib()
+    local SOURCES = {
+        "http://localhost:8081/MacLib.lua",                                        -- локальный дев-сервер
+        "https://raw.githubusercontent.com/dvorfkar6-lab/uis/refs/heads/main/Mac", -- прод (github)
+    }
+    for _, url in ipairs(SOURCES) do
+        local ok, src = pcall(function() return game:HttpGet(url) end)
+        if ok and type(src) == "string" and #src > 100 then
+            local chunk = loadstring(src)
+            if chunk then
+                local okRun, lib = pcall(chunk)
+                if okRun and type(lib) == "table" then return lib end
+            end
+        end
+    end
+    error("Apel Hub: не удалось загрузить MacLib (localhost и github недоступны)")
+end
+local MacLib = loadMacLib()
+
+-- ===================== SERVICES & VARIABLES =====================
+Players           = game:GetService("Players")
+ReplicatedStorage = game:GetService("ReplicatedStorage")
+RunService        = game:GetService("RunService")
+Workspace         = game:GetService("Workspace")
+LocalPlayer       = Players.LocalPlayer
+GameName          = "Anime Origins"
+
+-- ===================== ACTIVITY PRIORITY (арбитр TP-фич) =====================
+ActivityPriority = {
+    currentActivity = nil,
+    activities = {
+        Finger = 160, Flower = 150, GlobalBoss = 200, Rift = 140, BossFight = 120,
+        Gamemode = 100, Gacha = 80, Egg = 60, AutoFarm = 40, AutoClick = 20,
+    },
+}
+function ActivityPriority:CanStart(name)
+    if not self.currentActivity then return true end
+    return (self.activities[name] or 0) >= (self.activities[self.currentActivity] or 0)
+end
+function ActivityPriority:SetActivity(name)
+    if name == nil then self.currentActivity = nil; return true end
+    if self:CanStart(name) then self.currentActivity = name; return true end
+    return false
+end
+function ActivityPriority:ClearActivity(name)
+    if self.currentActivity == name then self.currentActivity = nil end
+end
+getgenv().ActivityPriority = ActivityPriority
+
+-- ===================== UI SETUP =====================
+Window = MacLib:Window({
+    Title = tostring(GameName) .. " | Apel Hub",
+    Subtitle = "",
+    Size = UDim2.fromOffset(865, 650),
+    DragStyle = 2,
+    DisabledWindowControls = {},
+    ShowUserInfo = false,
+    Keybind = Enum.KeyCode.LeftControl,
+    AcrylicBlur = false,
+})
+
+tabGroups = { MainGroup = Window:TabGroup() }
+tabs = {
+    Main     = tabGroups.MainGroup:Tab({ Name = "Main",     Image = "rbxassetid://10723407389" }),
+    Summon   = tabGroups.MainGroup:Tab({ Name = "Summon",   Image = "rbxassetid://10723345518" }),
+    Rewards  = tabGroups.MainGroup:Tab({ Name = "Rewards",  Image = "rbxassetid://10723396225" }),
+    Misc     = tabGroups.MainGroup:Tab({ Name = "Misc",     Image = "rbxassetid://10747372992" }),
+    Settings = tabGroups.MainGroup:Tab({ Name = "Settings", Image = "rbxassetid://10734950309" }),
+}
+sections = {
+    CodesL          = tabs.Main:Section({ Side = "Left" }),
+    CodesR          = tabs.Main:Section({ Side = "Right" }),
+    SummonL         = tabs.Summon:Section({ Side = "Left" }),
+    SummonR         = tabs.Summon:Section({ Side = "Right" }),
+    RewardsL        = tabs.Rewards:Section({ Side = "Left" }),
+    RewardsR        = tabs.Rewards:Section({ Side = "Right" }),
+    MiscSection1    = tabs.Misc:Section({ Side = "Left" }),
+    MiscSection2    = tabs.Misc:Section({ Side = "Right" }),
+    SettingsSection = tabs.Settings:Section({ Side = "Left" }),
+    SettingsInfo    = tabs.Settings:Section({ Side = "Right" }),
+}
+
+-- ===================== ANTI-AFK (3 блока — verbatim) =====================
+coroutine.wrap(function()
+    local GC = getconnections or get_signal_cons
+    if GC then
+        for i, v in pairs(GC(LocalPlayer.Idled)) do
+            if v["Disable"] then v["Disable"](v) elseif v["Disconnect"] then v["Disconnect"](v) end
+        end
+    else
+        local VirtualUser = cloneref(game:GetService("VirtualUser"))
+        LocalPlayer.Idled:Connect(function()
+            VirtualUser:CaptureController()
+            VirtualUser:ClickButton2(Vector2.new())
+        end)
+    end
+end)()
+
+do
+    local antiAfkThread = nil
+    local function startAntiAfkLoop(character)
+        if antiAfkThread then pcall(task.cancel, antiAfkThread); antiAfkThread = nil end
+        local humanoid = character:WaitForChild("Humanoid")
+        antiAfkThread = task.spawn(function()
+            while humanoid and humanoid.Parent do
+                task.wait(60)
+                if humanoid and humanoid.Parent then
+                    for _, c in pairs(getconnections(humanoid.Running)) do
+                        pcall(function() c:Fire(1) end)
+                    end
+                end
+            end
+        end)
+    end
+    if LocalPlayer.Character then startAntiAfkLoop(LocalPlayer.Character) end
+    LocalPlayer.CharacterAdded:Connect(startAntiAfkLoop)
+end
+
+coroutine.wrap(function()
+    local VIM = game:GetService("VirtualInputManager")
+    while true do
+        task.wait(300)
+        pcall(function()
+            VIM:SendKeyEvent(true,  Enum.KeyCode.Unknown, false, game)
+            task.wait(0.05)
+            VIM:SendKeyEvent(false, Enum.KeyCode.Unknown, false, game)
+        end)
+    end
+end)()
+
+-- ===================== NOTIFY HELPER =====================
+function Notify(text)
+    pcall(function()
+        Window:Notify({ Title = "Apel Hub", Description = tostring(text), Lifetime = 5, SizeX = 260 })
+    end)
+end
+
+-- ===================== SAFE MODULE LOADER (Standard remotes) =====================
+-- Anime Origins = Standard (сырые RemoteFunction). Коды и данные живут только в LOBBY-плейсе.
+R = {}                       -- ремоуты
+CodesRF, DataRF, ModulesLoaded = nil, nil, false
+pcall(function()
+    local LR = ReplicatedStorage:WaitForChild("LobbyRemotes", 10)
+    local RM = ReplicatedStorage:WaitForChild("Remotes", 10)
+    if LR then
+        R.Codes        = LR:FindFirstChild("CodesFunction")
+        R.Quest        = LR:FindFirstChild("QuestRemote")
+        R.PlayTime     = LR:FindFirstChild("PlayTimeRewardsRemote")
+        R.Battlepass   = LR:FindFirstChild("BattlepassRemote")
+        R.Misc         = LR:FindFirstChild("MiscRemote")
+        R.SummonF      = LR:FindFirstChild("SummonFunction")
+        R.SummonE      = LR:FindFirstChild("SummonRemote")
+    end
+    if RM then
+        R.Event        = RM:FindFirstChild("RemoteEvent")
+        R.Wheel        = RM:FindFirstChild("DailyWheelFunction")
+        R.Data         = RM.DataRemotes and RM.DataRemotes:FindFirstChild("DataFunction")
+        R.Inventory    = RM.InventoryRemotes and RM.InventoryRemotes:FindFirstChild("InventoryRemote")
+    end
+end)
+CodesRF, DataRF = R.Codes, R.Data
+ModulesLoaded = (CodesRF ~= nil)
+
+-- общие модули игры (нужны для tower-index наград и уровня игрока)
+CalcStuff = nil
+pcall(function() CalcStuff = require(ReplicatedStorage:WaitForChild("Modules"):WaitForChild("CalculateStuff")) end)
+
+function GetPlayerData()
+    if not DataRF then return nil end
+    local ok, res = pcall(function() return DataRF:InvokeServer("GetPlayerData") end)
+    return ok and type(res) == "table" and res or nil
+end
+
+-- ===================== CODES =====================
+-- Список кодов игры. Сервер хранит их у себя (клиенту не реплицирует), собрать из игры нечем —
+-- поэтому список ведём здесь. Чтобы добавить новый код — просто допиши строку.
+-- Регистр и символы важны: сервер сравнивает СТРОГО (thankyou! / THANKYOU — уже невалидны).
+CODES = {
+    "THANKYOU!",   -- 10 Stat Rerolls + 10 Perfect Stat Rerolls
+    "TYKaito!",    -- 1 000 Gems + 25 Trait Rerolls + 5 Stat Prisms
+    "AO",          -- 25 Rerolls
+    "Origins",     -- 20 Stat Rerolls + 10 Perfect Stat Rerolls
+    "Release!",    -- 1 750 Gems
+}
+
+local CODE_COOLDOWN = 3.4   -- серверный анти-спам ~3 c между любыми попытками (замерено)
+local codesBusy = false
+
+-- Уже отредименные коды лежат в профиле игрока: PlayerData.RedeemedCodes.
+-- ВАЖНО: клиентский кэш GlobalTables.PlayerData сервер после редима НЕ обновляет (ChangeData не шлёт),
+-- поэтому источник правды — свежий InvokeServer("GetPlayerData"); кэш только как фолбэк.
+local function getRedeemedSet()
+    local set = {}
+    local data = GetPlayerData()
+    if type(data) ~= "table" or type(data.RedeemedCodes) ~= "table" then
+        pcall(function()
+            local GlobalTables = require(ReplicatedStorage:WaitForChild("Modules"):WaitForChild("GlobalTables"))
+            data = GlobalTables and GlobalTables.PlayerData
+        end)
+    end
+    if type(data) == "table" and type(data.RedeemedCodes) == "table" then
+        for _, c in pairs(data.RedeemedCodes) do set[tostring(c)] = true end
+    end
+    return set
+end
+
+-- Возвращает: "redeemed" | "already" | "invalid" | "failed"
+local function redeemOne(code)
+    for attempt = 1, 5 do
+        if not getgenv()._running then return "failed" end
+        local ok, msg, success = pcall(function() return CodesRF:InvokeServer("RedeemCode", code) end)
+        if ok then
+            msg = tostring(msg)
+            if success == true or (msg:find("Redeemed!") and not msg:find("Already")) then
+                return "redeemed"
+            elseif msg:find("Already") then
+                return "already"
+            elseif msg:find("Try again") then
+                task.wait(CODE_COOLDOWN)   -- попали в анти-спам — ждём и повторяем
+            else
+                return "invalid"           -- "Invalid Code!" и всё прочее
+            end
+        else
+            task.wait(1)
+        end
+    end
+    return "failed"
+end
+
+local codesStatus = sections.CodesR:Label({ Text = "Status: idle" })
+local function setCodesStatus(t) pcall(function() codesStatus:UpdateName("Status: " .. t) end) end
+
+-- Один проход по всем кодам. Уже отредименные пропускаем — не тратим кулдаун впустую.
+-- silent = true → без уведомления (для авто-цикла, когда ничего нового нет)
+local function redeemAllCodes(silent)
+    if codesBusy or not ModulesLoaded then return end
+    codesBusy = true
+
+    local redeemedSet = getRedeemedSet()
+    local pending = {}
+    for _, code in ipairs(CODES) do
+        if not redeemedSet[code] then table.insert(pending, code) end
+    end
+
+    if #pending == 0 then
+        setCodesStatus(string.format("all %d codes already redeemed", #CODES))
+        if not silent then Notify("Codes: all " .. #CODES .. " already redeemed") end
+        codesBusy = false
+        return
+    end
+
+    local got, already, bad = 0, 0, 0
+    for i, code in ipairs(pending) do
+        if not getgenv()._running then break end
+        setCodesStatus(string.format("redeeming %s (%d/%d)", code, i, #pending))
+        local res = redeemOne(code)
+        if res == "redeemed" then got = got + 1
+        elseif res == "already" then already = already + 1
+        else bad = bad + 1 end
+        if i < #pending then task.wait(CODE_COOLDOWN) end
+    end
+
+    setCodesStatus(string.format("+%d new · %d already · %d invalid", got, already, bad))
+    if got > 0 or not silent then
+        Notify(string.format("Codes: +%d redeemed, %d already, %d invalid", got, already, bad))
+    end
+    codesBusy = false
+end
+
+sections.CodesL:Header({ Text = "Codes" })
+
+if not ModulesLoaded then
+    sections.CodesL:Label({ Text = "⚠ Lobby only — codes remote not found here" })
+else
+    autoCodes = false
+    sections.CodesL:Toggle({
+        Name = "Auto Redeem Codes",
+        Default = false,
+        Info = "Redeems every unredeemed code and re-checks periodically",
+        Callback = function(state) autoCodes = state end
+    }, "AutoRedeemCodes")
+
+    sections.CodesL:Button({
+        Name = "Redeem All Codes",
+        Callback = function() task.spawn(function() redeemAllCodes(false) end) end
+    })
+
+    -- фоновый цикл: проходит сразу при включении, дальше перепроверяет раз в 5 минут
+    task.spawn(function()
+        local nextRun = 0
+        while true do
+            if getgenv()._running and autoCodes and os.clock() >= nextRun then
+                pcall(function() redeemAllCodes(true) end)
+                nextRun = os.clock() + 300
+            elseif not autoCodes then
+                nextRun = 0   -- при следующем включении пройтись сразу
+            end
+            task.wait(1)
+        end
+    end)
+end
+
+sections.CodesR:Header({ Text = "Known Codes" })
+do
+    local list = {}
+    for _, c in ipairs(CODES) do table.insert(list, "• " .. c) end
+    sections.CodesR:Paragraph({
+        Header = #CODES .. " codes",
+        Body = table.concat(list, "\n") .. "\n\nOne-time use per account (saved in your profile).",
+    })
+end
+task.spawn(function()
+    task.wait(2)
+    if ModulesLoaded then
+        local set = getRedeemedSet()
+        local n = 0
+        for _, c in ipairs(CODES) do if set[c] then n = n + 1 end end
+        setCodesStatus(string.format("%d/%d already redeemed", n, #CODES))
+    end
+end)
+
+-- ===================== SUMMON =====================
+-- Баннеры и их пулы юнитов тянем из игры: SummonFunction:InvokeServer("GetBanner").
+-- Ничего не захардкожено — новый баннер/юнит подхватится сам (кнопка Refresh).
+summonBanners   = {}
+selectedBanner  = nil
+summonAmount    = 10
+summonTargets   = {}      -- set реальных имён юнитов
+autoSummon      = false
+
+local RARITY_HEX = { Rare = "#3498DB", Epic = "#9B59B6", Legendary = "#FFD700",
+                     Mythic = "#ED4245", Secret = "#00FFFF", Limited = "#FF8C00" }
+local RARITY_ORDER = { Secret = 1, Mythic = 2, Legendary = 3, Epic = 4, Rare = 5 }
+local unitDisplayToName = {}
+
+local function fetchBanners()
+    if not R.SummonF then return {} end
+    local ok, res = pcall(function() return R.SummonF:InvokeServer("GetBanner") end)
+    return (ok and type(res) == "table") and res or {}
+end
+
+local function buildBannerOptions()
+    local names = {}
+    for key, b in pairs(summonBanners) do
+        table.insert(names, { key = key, order = (type(b) == "table" and b.LayoutOrder) or 99 })
+    end
+    table.sort(names, function(a, b) return a.order < b.order end)
+    local out = {}
+    for _, n in ipairs(names) do table.insert(out, n.key) end
+    return out
+end
+
+-- опции красим по рарности (MacLib рендерит их RichText) + держим обратный map display -> имя
+local function buildUnitOptions(bannerKey)
+    unitDisplayToName = {}
+    local b = summonBanners[bannerKey]
+    if type(b) ~= "table" or type(b.BannerTowers) ~= "table" then return {} end
+    local rows = {}
+    for rarity, list in pairs(b.BannerTowers) do
+        if type(list) == "table" then
+            for _, unit in pairs(list) do
+                table.insert(rows, { unit = tostring(unit), rarity = tostring(rarity) })
+            end
+        end
+    end
+    table.sort(rows, function(a, b2)
+        local oa, ob = RARITY_ORDER[a.rarity] or 9, RARITY_ORDER[b2.rarity] or 9
+        if oa ~= ob then return oa < ob end
+        return a.unit < b2.unit
+    end)
+    local out = {}
+    for _, r in ipairs(rows) do
+        local disp = string.format('<font color="%s">[%s]</font> %s',
+            RARITY_HEX[r.rarity] or "#FFFFFF", r.rarity, r.unit)
+        unitDisplayToName[disp] = r.unit
+        table.insert(out, disp)
+    end
+    return out
+end
+
+local function resolveUnitName(disp)
+    return unitDisplayToName[disp]
+        or (tostring(disp):gsub("<[^>]->", "")):match("%]%s*(.+)$")
+        or disp
+end
+
+sections.SummonL:Header({ Text = "Summon" })
+
+if not R.SummonF then
+    sections.SummonL:Label({ Text = "⚠ Lobby only — summon remote not found here" })
+else
+    summonBanners = fetchBanners()
+
+    local summonStatus = sections.SummonR:Label({ Text = "Status: idle" })
+    local function setSummonStatus(t) pcall(function() summonStatus:UpdateName("Status: " .. t) end) end
+
+    local unitDropdown
+    local bannerDropdown = sections.SummonL:Dropdown({
+        Name = "Banner",
+        Options = buildBannerOptions(),
+        Callback = function(v)
+            selectedBanner = v
+            -- каскад: пул юнитов зависит от баннера
+            if unitDropdown then
+                pcall(function()
+                    unitDropdown:ClearOptions()
+                    task.wait(0.05)
+                    unitDropdown:InsertOptions(buildUnitOptions(v))
+                end)
+            end
+        end,
+    }, "SummonBanner")
+
+    unitDropdown = sections.SummonL:Dropdown({
+        Name = "Stop On Unit",
+        Multi = true,
+        Search = true,
+        Options = {},
+        Callback = function(sel)
+            summonTargets = {}
+            if type(sel) ~= "table" then return end
+            for disp, on in pairs(sel) do
+                if on then summonTargets[resolveUnitName(disp)] = true end
+            end
+        end,
+    }, "SummonTargets")
+
+    sections.SummonL:Dropdown({
+        Name = "Amount",
+        Options = { "x1", "x10" },
+        Default = "x10",
+        Callback = function(v) summonAmount = (v == "x10") and 10 or 1 end,
+    }, "SummonAmount")
+
+    -- если баннер один — выбираем его сразу, чтобы пул юнитов не был пустым до клика
+    task.spawn(function()
+        task.wait(0.3)
+        local opts = buildBannerOptions()
+        if not selectedBanner and #opts > 0 then
+            selectedBanner = opts[1]
+            pcall(function() bannerDropdown:UpdateSelection(opts[1]) end)
+            pcall(function() unitDropdown:InsertOptions(buildUnitOptions(opts[1])) end)
+        end
+    end)
+
+    sections.SummonL:Button({
+        Name = "Refresh Banners",
+        Callback = function()
+            summonBanners = fetchBanners()
+            pcall(function()
+                bannerDropdown:ClearOptions()
+                task.wait(0.05)
+                bannerDropdown:InsertOptions(buildBannerOptions())
+            end)
+            if selectedBanner then
+                pcall(function()
+                    unitDropdown:ClearOptions()
+                    task.wait(0.05)
+                    unitDropdown:InsertOptions(buildUnitOptions(selectedBanner))
+                end)
+            end
+        end,
+    })
+
+    local summonToggle
+    summonToggle = sections.SummonL:Toggle({
+        Name = "Auto Summon",
+        Default = false,
+        Info = "Stops on a selected unit, on empty currency or on full tower slots",
+        Callback = function(state) autoSummon = state end,
+    }, "AutoSummon")
+
+    local function stopSummon(reason)
+        autoSummon = false
+        task.defer(function() pcall(function() summonToggle:UpdateState(false) end) end)
+        setSummonStatus(reason)
+    end
+
+    -- имена выпавших юнитов из ответа сервера (форма ответа может отличаться — разбираем обе)
+    local function pulledNames(res)
+        local names = {}
+        if type(res) ~= "table" then return names end
+        for _, v in pairs(res) do
+            if type(v) == "table" then
+                local n = v.Name or v.TowerName
+                if n then table.insert(names, tostring(n)) end
+            elseif type(v) == "string" then
+                table.insert(names, v)
+            end
+        end
+        return names
+    end
+
+    summonTotal = 0
+    task.spawn(function()
+        while true do
+            -- зависимости валидируем ВНУТРИ цикла, а не в колбэке тоггла
+            if getgenv()._running and autoSummon and selectedBanner and R.SummonF then
+                local ok = pcall(function()
+                    local data = GetPlayerData()
+                    local b = summonBanners[selectedBanner]
+                    if not data or type(b) ~= "table" then return end
+
+                    local price    = b.SummonPrice or 0
+                    local curType  = (b.SummonCurrency and b.SummonCurrency.ItemType) or "Currency"
+                    local curName  = (b.SummonCurrency and b.SummonCurrency.ItemName) or "Gems"
+                    local have     = (data.Inventory and data.Inventory[curType]
+                                      and data.Inventory[curType][curName]) or 0
+                    local amount   = summonAmount
+
+                    if have < price * amount then
+                        return stopSummon("out of " .. curName .. " (" .. have .. ")")
+                    end
+
+                    local owned = 0
+                    for _ in pairs((data.Inventory and data.Inventory.Towers) or {}) do owned = owned + 1 end
+                    if (data.MaxTowerSlot or 0) < owned + amount then
+                        return stopSummon("tower slots full (" .. owned .. "/" .. (data.MaxTowerSlot or 0) .. ")")
+                    end
+
+                    local res = R.SummonF:InvokeServer("SummonTower", selectedBanner, amount)
+                    local names = pulledNames(res)
+                    if #names == 0 then return end
+                    summonTotal = summonTotal + #names
+                    setSummonStatus(string.format("%d summoned · %s left: %d",
+                        summonTotal, curName, have - price * amount))
+
+                    if next(summonTargets) then
+                        for _, n in ipairs(names) do
+                            if summonTargets[n] then
+                                stopSummon("got " .. n .. "!")
+                                Notify("Target unit: " .. n)
+                                return
+                            end
+                        end
+                    end
+                end)
+                if not ok then task.wait(1) end
+            end
+            task.wait(0.6)
+        end
+    end)
+
+    sections.SummonR:Header({ Text = "Banner info" })
+    local infoParagraph = sections.SummonR:Paragraph({ Header = "—", Body = "Pick a banner." })
+    task.spawn(function()
+        while true do
+            task.wait(2)
+            local b = selectedBanner and summonBanners[selectedBanner]
+            if type(b) == "table" then
+                local chances = {}
+                for rarity, c in pairs(b.SummonChances or {}) do
+                    table.insert(chances, { r = rarity, c = c })
+                end
+                table.sort(chances, function(x, y)
+                    return (RARITY_ORDER[x.r] or 9) < (RARITY_ORDER[y.r] or 9)
+                end)
+                local lines = {}
+                for _, e in ipairs(chances) do
+                    table.insert(lines, string.format("%s — %.4f%%", e.r, e.c * 100))
+                end
+                local pity = {}
+                for _, k in ipairs({ "LegendaryPity", "MythicPity", "SecretPity" }) do
+                    if b[k] then table.insert(pity, k:gsub("Pity", "") .. " pity: " .. tostring(b[k])) end
+                end
+                pcall(function()
+                    infoParagraph:UpdateHeader(tostring(b.DisplayName or selectedBanner)
+                        .. " — " .. tostring(b.SummonPrice) .. " "
+                        .. tostring(b.SummonCurrency and b.SummonCurrency.ItemName or ""))
+                    infoParagraph:UpdateBody(table.concat(lines, "\n") .. "\n\n" .. table.concat(pity, "\n"))
+                end)
+            end
+        end
+    end)
+end
+
+-- ===================== REWARDS: собрать всё, что даётся бесплатно =====================
+-- Все экшены сняты с клиентских модулей игры (LobbyModules.UIHandler.*), аргументы строятся
+-- динамически из профиля игрока — никаких захардкоженных индексов/имён.
+local rewardsBusy = false
+local rewardsStatus = sections.RewardsR:Label({ Text = "Status: idle" })
+local function setRewardsStatus(t) pcall(function() rewardsStatus:UpdateName("Status: " .. t) end) end
+
+local function fire(remote, ...)
+    if not remote then return false end
+    local args = table.pack(...)
+    return (pcall(function() remote:FireServer(table.unpack(args, 1, args.n)) end))
+end
+
+-- Каждый источник: имя -> функция(data) -> кол-во отправленных запросов
+local REWARD_SOURCES = {
+    {
+        Name = "Quests",
+        Run = function(data)
+            local n = 0
+            if fire(R.Quest, "ClaimAllQuests") then n = n + 1 end
+            for key in pairs((data and data.Quests and data.Quests.Permanent) or {}) do
+                task.wait(0.15)
+                if fire(R.Quest, "ClaimPermanentQuest", key) then n = n + 1 end
+            end
+            for lineName, line in pairs((data and data.Quests and data.Quests.QuestLines) or {}) do
+                if type(line) == "table" then
+                    for _, q in pairs(line) do
+                        if type(q) == "table" and q.QuestIndex and not q.Claimed then
+                            task.wait(0.15)
+                            if fire(R.Quest, "ClaimQuestLineQuest", lineName, q.QuestIndex) then n = n + 1 end
+                        end
+                    end
+                end
+            end
+            return n
+        end,
+    },
+    {
+        Name = "Daily Reward",
+        Run = function()
+            local n = 0
+            if fire(R.Event, "ClaimDailyReward", "Normal") then n = n + 1 end
+            -- Upgraded-трек только для Roblox Premium, сервер сам отсеет остальных
+            if LocalPlayer.MembershipType == Enum.MembershipType.Premium then
+                task.wait(0.2)
+                if fire(R.Event, "ClaimDailyReward", "Upgraded") then n = n + 1 end
+            end
+            return n
+        end,
+    },
+    {
+        Name = "Daily Wheel",
+        Run = function()
+            if not R.Wheel then return 0 end
+            local ok = pcall(function() return R.Wheel:InvokeServer(true) end)   -- true = бесплатный спин
+            return ok and 1 or 0
+        end,
+    },
+    {
+        Name = "Playtime",
+        Run = function(data)
+            local claimed = (data and data.PlayTimeRewards and data.PlayTimeRewards.Claimed) or {}
+            local n = 0
+            for i = 1, 12 do
+                if not (claimed[i] or claimed[tostring(i)]) then
+                    if fire(R.PlayTime, "ClaimPlayTimeReward", i) then n = n + 1 end
+                    task.wait(0.15)
+                end
+            end
+            return n
+        end,
+    },
+    {
+        Name = "Battlepass",
+        Run = function(data)
+            local n = 0
+            for season in pairs((data and data.Battlepasses) or {}) do
+                if fire(R.Battlepass, "ClaimBattlepass", season) then n = n + 1 end
+                task.wait(0.15)
+            end
+            return n
+        end,
+    },
+    {
+        Name = "Level Milestones",
+        Run = function() return fire(R.Event, "ClaimLevelMilestone") and 1 or 0 end,
+    },
+    {
+        Name = "Group Reward",
+        Run = function() return fire(R.Event, "ClaimGroupReward") and 1 or 0 end,
+    },
+    {
+        Name = "Tower Index",
+        Run = function(data)
+            if not (data and CalcStuff and R.Inventory) then return 0 end
+            -- сервер требует уровень CalculateStuff.RequiredTowerIndexLevel
+            local lvl = CalcStuff.GetPlayerLevelFromExp and CalcStuff.GetPlayerLevelFromExp(data.Exp or 0) or 0
+            if CalcStuff.RequiredTowerIndexLevel and lvl < CalcStuff.RequiredTowerIndexLevel then
+                return 0
+            end
+            local n = 0
+            -- 1) награда за каждую открытую башню (батч-форма, как у кнопки Claim All в игре)
+            local towers = {}
+            for name in pairs(data.TowerIndex or {}) do table.insert(towers, name) end
+            if #towers > 0 and fire(R.Inventory, "ClaimIndexReward", towers) then n = n + 1 end
+            -- 2) майлстоуны коллекции — повторяем логику игры один в один
+            local milestones = {}
+            local claimedMs = data.TowerIndexMilestones or {}
+            for _, rarity in pairs(CalcStuff.TowerRarities or {}) do
+                local tiers = CalcStuff.IndexCollectionMilestone and CalcStuff.IndexCollectionMilestone[rarity]
+                if tiers then
+                    local discovered = (CalcStuff.CountDiscoveredTowers
+                        and CalcStuff.CountDiscoveredTowers(data.TowerIndex or {}, rarity)) or 0
+                    for count in pairs(tiers) do
+                        if not claimedMs[rarity .. "." .. tostring(count)] and count <= discovered then
+                            table.insert(milestones, { Rarity = rarity, Count = count })
+                        end
+                    end
+                end
+            end
+            if #milestones > 0 then
+                task.wait(0.2)
+                if fire(R.Inventory, "ClaimIndexMilestoneReward", milestones) then n = n + 1 end
+            end
+            return n
+        end,
+    },
+    {
+        Name = "Rank Rewards",
+        Run = function() return fire(R.Misc, "ClaimRankRewards", "InfinityCastle") and 1 or 0 end,
+    },
+}
+
+selectedRewardSources = {}
+for _, s in ipairs(REWARD_SOURCES) do selectedRewardSources[s.Name] = true end
+
+local function claimAllRewards(silent)
+    if rewardsBusy or not ModulesLoaded then return end
+    rewardsBusy = true
+    local data = GetPlayerData()
+    local total, used = 0, {}
+    for _, src in ipairs(REWARD_SOURCES) do
+        if not getgenv()._running then break end
+        if selectedRewardSources[src.Name] then
+            setRewardsStatus("claiming " .. src.Name .. "...")
+            local ok, n = pcall(src.Run, data)
+            if ok and type(n) == "number" and n > 0 then
+                total = total + n
+                table.insert(used, src.Name)
+            end
+            task.wait(0.35)
+        end
+    end
+    setRewardsStatus(string.format("sent %d claim(s) across %d source(s)", total, #used))
+    if not silent then Notify(string.format("Rewards: %d claims sent (%s)", total,
+        #used > 0 and table.concat(used, ", ") or "nothing to claim")) end
+    rewardsBusy = false
+end
+
+sections.RewardsL:Header({ Text = "Rewards" })
+
+if not ModulesLoaded then
+    sections.RewardsL:Label({ Text = "⚠ Lobby only — reward remotes not found here" })
+else
+    local sourceNames = {}
+    for _, s in ipairs(REWARD_SOURCES) do table.insert(sourceNames, s.Name) end
+
+    sections.RewardsL:Dropdown({
+        Name = "Sources",
+        Multi = true,
+        Search = true,
+        Options = sourceNames,
+        Callback = function(sel)
+            if type(sel) ~= "table" then return end
+            local any = false
+            for _, on in pairs(sel) do
+                if on then any = true end
+            end
+            if not any then return end   -- пустой выбор игнорируем, иначе фича молча ничего не делает
+            selectedRewardSources = {}
+            for name, on in pairs(sel) do if on then selectedRewardSources[name] = true end end
+        end,
+    }, "RewardSources")
+
+    autoRewards = false
+    sections.RewardsL:Toggle({
+        Name = "Auto Claim Rewards",
+        Default = false,
+        Info = "Runs on enable, then re-checks every 5 minutes",
+        Callback = function(state) autoRewards = state end
+    }, "AutoClaimRewards")
+
+    sections.RewardsL:Button({
+        Name = "Claim All Now",
+        Callback = function() task.spawn(function() claimAllRewards(false) end) end
+    })
+
+    task.spawn(function()
+        local nextRun = 0
+        while true do
+            if getgenv()._running and autoRewards and os.clock() >= nextRun then
+                pcall(function() claimAllRewards(true) end)
+                nextRun = os.clock() + 300
+            elseif not autoRewards then
+                nextRun = 0
+            end
+            task.wait(1)
+        end
+    end)
+end
+
+sections.RewardsR:Header({ Text = "What gets claimed" })
+sections.RewardsR:Paragraph({
+    Header = #REWARD_SOURCES .. " sources",
+    Body = "• Quests — ClaimAllQuests + permanent + questlines\n"
+        .. "• Daily Reward — Normal (+ Upgraded if Premium)\n"
+        .. "• Daily Wheel — free spin\n"
+        .. "• Playtime — every unclaimed tier\n"
+        .. "• Battlepass — every season in your data\n"
+        .. "• Level Milestones / Group Reward\n"
+        .. "• Tower Index — unit rewards + collection milestones\n"
+        .. "• Rank Rewards — Infinity Castle\n\n"
+        .. "Server rejects anything not actually available, so re-running is harmless.",
+})
+
+-- ===================== MISC: Walk Speed (watcher, чтобы игра не сбрасывала) =====================
+sections.MiscSection1:Header({ Text = "Movement" })
+speedConnection = nil
+currentSpeed = 25
+walkSpeedPropConnection = nil
+sections.MiscSection1:Slider({
+    Name = "Walk Speed", Default = 25, Minimum = 16, Maximum = 200,
+    DisplayMethod = "Value", Precision = 0,
+    Callback = function(speed)
+        currentSpeed = speed
+        local ch = LocalPlayer.Character
+        local h = ch and ch:FindFirstChild("Humanoid")
+        if h then h.WalkSpeed = speed end
+    end
+}, "WalkSpeedSlider")
+function setupWalkSpeedWatcher(character)
+    if walkSpeedPropConnection then walkSpeedPropConnection:Disconnect(); walkSpeedPropConnection = nil end
+    local humanoid = character:WaitForChild("Humanoid")
+    humanoid.WalkSpeed = currentSpeed
+    walkSpeedPropConnection = humanoid:GetPropertyChangedSignal("WalkSpeed"):Connect(function()
+        if humanoid.WalkSpeed ~= currentSpeed then humanoid.WalkSpeed = currentSpeed end
+    end)
+end
+if speedConnection then speedConnection:Disconnect() end
+speedConnection = LocalPlayer.CharacterAdded:Connect(setupWalkSpeedWatcher)
+if LocalPlayer.Character then setupWalkSpeedWatcher(LocalPlayer.Character) end
+
+sections.MiscSection2:Header({ Text = "Info" })
+sections.MiscSection2:Paragraph({
+    Header = "Anime Origins",
+    Body = "Codes remote: LobbyRemotes.CodesFunction\nInvokeServer(\"RedeemCode\", code) -> (message, success)\nServer anti-spam: ~3s between attempts.",
+})
+
+-- ===================== SETTINGS =====================
+sections.SettingsSection:Header({ Text = "UI Settings" })
+sections.SettingsSection:Slider({
+    Name = "UI Size", Default = 0.75, Minimum = 0.5, Maximum = 2,
+    DisplayMethod = "Value", Precision = 2,
+    Callback = function(v) Window:SetScale(v) end
+}, "UiSizeSlider")
+task.spawn(function()
+    task.wait(0.1)
+    Window:GlobalSetting({ Name = "UI Blur", Default = Window:GetAcrylicBlurState(),
+        Callback = function(b) Window:SetAcrylicBlurState(b) end })
+    Window:GlobalSetting({ Name = "Notifications", Default = Window:GetNotificationsState(),
+        Callback = function(b) Window:SetNotificationsState(b) end })
+end)
+sections.SettingsSection:Button({ Name = "Destroy GUI", Callback = function() getgenv()._ApelStop() end })
+
+sections.SettingsInfo:Header({ Text = "About" })
+sections.SettingsInfo:Paragraph({ Header = "Apel Hub", Body = "Anime Origins — testing build." })
+
+-- ===================== FINALIZE =====================
+task.spawn(function()
+    task.wait(0.2)
+    Window:CreateMinimizer({ Size = UDim2.fromOffset(50, 50),
+        Position = UDim2.new(1, -10, 0.5, 0), Icon = "rbxassetid://138310609771261" })
+end)
+
+MacLib:SetFolder("ApelHub")
+local _configLoading = true
+local _origAutoSave = MacLib.AutoSave
+MacLib.AutoSave = function(self, ...) if _configLoading then return end; return _origAutoSave(self, ...) end
+task.spawn(function() MacLib:LoadAutoLoadConfig() end)
+task.spawn(function() task.wait(1); _configLoading = false end)
+task.spawn(function() tabs.Main:Select() end)
+
+getgenv()._ApelStop = function()
+    getgenv()._running = false
+    for _, c in pairs(getgenv()._conns or {}) do pcall(function() c:Disconnect() end) end
+    pcall(function() Window:Unload() end)
+end
+Window.onUnloaded(function() getgenv()._running = false; print("Apel Hub unloaded!") end)
+print("Apel Hub loaded!")
